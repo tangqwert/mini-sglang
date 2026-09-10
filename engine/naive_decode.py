@@ -63,16 +63,16 @@ def autoregressive_generate(
         - 时间复杂度说明（写进你的笔记）：每步都对整条序列重算一遍前向。
           这就是 M1 KV cache 要优化的点——先体会它有多慢。
     """
-    # TODO(你来实现): 
-    #  提示骨架（可删）：
-    #    generated = input_ids.clone()
-    #    for _ in range(config.max_new_tokens):
-    #        logits = logits_fn(generated)          # [B, T_cur, V]
-    #        next_token = ...                       # 取最后一个位置的 argmax → [B, 1]
-    #        命中 eos 则 break（提示：假设 batch 内同停）
-    #        generated = torch.cat([generated, next_token], dim=1)
-    #    return generated
-    raise NotImplementedError("M0: 由你来实现 autoregressive_generate")
+    generated = input_ids.clone()
+    for _ in range(config.max_new_tokens):
+        logits = logits_fn(generated)                             # [B, T_cur, V]
+        # 只取最后一个位置的分数 → [B, V]，argmax 得 [B]；keepdim 直接给 [B, 1]
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        # 先拼进去再判断：契约规定 EOS 本身也要保留在结果里
+        generated = torch.cat([generated, next_token], dim=1)
+        if config.eos_token_id is not None and (next_token == config.eos_token_id).any():
+            break
+    return generated
 
 
 def build_logits_fn(model, device: torch.device):
@@ -92,5 +92,10 @@ def build_logits_fn(model, device: torch.device):
         - HF 模型返回的是 ModelOutput 对象，logits 是它的字段。
         - dtype 不用管，M0 用默认 fp32/fp16 都行。
     """
-    # TODO(你来实现):
-    raise NotImplementedError("M0: 由你来实现 build_logits_fn")
+    def logits_fn(ids):
+        with torch.no_grad():
+            ids = ids.to(device)
+            output = model(input_ids=ids)
+            return output.logits
+
+    return logits_fn

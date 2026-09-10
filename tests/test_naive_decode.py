@@ -27,8 +27,10 @@ def make_increment_logits_fn(eos_after: int | None = None):
             next_tok = torch.where(hit, torch.full_like(next_tok, EOS), next_tok)
         # 把"想要的下一个 token"编码成 one-hot logits（argmax 必然选中它）
         logits = torch.full((ids.shape[0], ids.shape[1], VOCAB), -10.0)
-        logits[:, -1, :] = -10.0
-        logits[:, -1, next_tok] = 10.0
+        # 必须用 rows 指明"第几行"：否则 logits[:, -1, next_tok] 会广播成 [B, B]，
+        # 把每条序列的目标 token 写到所有行上（batch 用例就会互相串味）。
+        rows = torch.arange(ids.shape[0])
+        logits[rows, -1, next_tok] = 10.0
         return logits
 
     return logits_fn

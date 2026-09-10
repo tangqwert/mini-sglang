@@ -36,7 +36,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model).to(device).eval()
 
-    input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids  # [1, T]
+    # 关键：必须搬到 device 上。否则 generated 留在 CPU，而 logits_fn 算出的
+    # next_token 在 GPU，循环里的 torch.cat 会因设备不一致报错。
+    input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids.to(device)  # [1, T]
     logits_fn = build_logits_fn(model, device)
     cfg = DecodingConfig(max_new_tokens=args.max_new_tokens)
 
