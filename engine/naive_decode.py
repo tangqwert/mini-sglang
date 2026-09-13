@@ -42,6 +42,7 @@ def autoregressive_generate(
     input_ids: torch.LongTensor,
     config: DecodingConfig,
 ) -> torch.LongTensor:
+    
     """朴素自回归解码（贪心）。
 
     Args:
@@ -65,16 +66,13 @@ def autoregressive_generate(
     """
     generated = input_ids.clone()
     for _ in range(config.max_new_tokens):
-        logits = logits_fn(generated)                             # [B, T_cur, V]
-        # 只取最后一个位置的分数 → [B, V]，argmax 得 [B]；keepdim 直接给 [B, 1]
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        # 先拼进去再判断：契约规定 EOS 本身也要保留在结果里
-        generated = torch.cat([generated, next_token], dim=1)
-        if config.eos_token_id is not None and (next_token == config.eos_token_id).any():
+        new_tokens = logits_fn(generated)
+        new_tokens = torch.argmax(new_tokens[:,-1,:] ,dim = -1, keepdim = True)
+        generated = torch.cat((generated, new_tokens),dim = 1)
+        if config.eos_token_id != None and torch.any(new_tokens == config.eos_token_id):
             break
     return generated
-
-
+    
 def build_logits_fn(model, device: torch.device):
     """把 HuggingFace 因果语言模型包装成循环所需的 logits_fn。
 
@@ -91,11 +89,18 @@ def build_logits_fn(model, device: torch.device):
         - torch.no_grad() 忘了加会怎样？（内存泄漏+变慢——想想 autograd 在攒什么）
         - HF 模型返回的是 ModelOutput 对象，logits 是它的字段。
         - dtype 不用管，M0 用默认 fp32/fp16 都行。
+
+    ⚠️ 重写练习：实现已清空，请凭记忆从零写出这个包装函数。
     """
+    # TODO(你): 返回一个闭包 logits_fn(ids)。
+    # 骨架思路：
+    #   1. def logits_fn(ids): 开头
+    #   2. 关掉梯度（为什么这层该关，而不是让调用方关？）
+    #   3. ids 是 CPU 上来的 [B, T] → 搬到哪个设备？
+    #   4. 调 model，拿 .logits 返回
     def logits_fn(ids):
         with torch.no_grad():
-            ids = ids.to(device)
-            output = model(input_ids=ids)
-            return output.logits
-
+            input_ids = ids.to(device)
+            output = model(input_ids)
+        return output.logits
     return logits_fn
