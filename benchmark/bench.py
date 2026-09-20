@@ -20,6 +20,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from engine.naive_decode import DecodingConfig, autoregressive_generate, build_logits_fn
+from engine.kv_cache import build_kv_forward, kv_generate
 
 
 def main() -> None:
@@ -27,8 +28,14 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--out", default="benchmark/results/m0_naive.json")
+    parser.add_argument("--engine", choices=["naive", "kv"], default="naive",
+                        help="naive=M0 整条序列重算；kv=M1 KV cache 增量解码")
+    parser.add_argument("--out", default=None,
+                        help="默认按引擎自动命名: m0_naive.json / m1_kv.json")
     args = parser.parse_args()
+    if args.out is None:
+        args.out = "benchmark/results/m0_naive.json" if args.engine == "naive" \
+            else "benchmark/results/m1_kv.json"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device = {device}")
@@ -39,16 +46,25 @@ def main() -> None:
     # 关键：必须搬到 device 上。否则 generated 留在 CPU，而 logits_fn 算出的
     # next_token 在 GPU，循环里的 torch.cat 会因设备不一致报错。
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids.to(device)  # [1, T]
-    logits_fn = build_logits_fn(model, device)
     cfg = DecodingConfig(max_new_tokens=args.max_new_tokens)
 
+    # 两条引擎路径对齐成同一个 generate(ids) 接口——测量代码完全复用，保证公平
+    if args.engine == "naive":
+        logits_fn = build_logits_fn(model, device)
+        def generate(ids):
+            return autoregressive_generate(logits_fn, ids, cfg)
+    else:
+        kv_forward = build_kv_forward(model, device)
+        def generate(ids):
+            return kv_generate(kv_forward, ids, cfg)
+
     # 预热 1 次（首步含 CUDA kernel 编译/显存分配，不预热会污染数据）
-    autoregressive_generate(logits_fn, input_ids, cfg)
+    generate(input_ids)
     torch.cuda.synchronize()
 
     # 正式测量
     start = time.perf_counter()
-    output = autoregressive_generate(logits_fn, input_ids, cfg)
+    output = generate(input_ids)
     torch.cuda.synchronize()  # 关键：异步执行下，不同步就测不准
     elapsed = time.perf_counter() - start
 
@@ -68,6 +84,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({
         "model": args.model,
+        "engine": args.engine,
         "prompt_tokens": input_ids.shape[1],
         "new_tokens": n_new,
         "total_s": elapsed,

@@ -8,7 +8,7 @@
 ## 里程碑
 
 - [x] **M0** Naive 解码循环 + baseline 吞吐测量 ← 当前阶段（179.2 tokens/s @ gpt2）
-- [ ] **M1** KV Cache（正确性对比 + 加速比）
+- [x] **M1** KV Cache（正确性对比 + 加速比）← 当前阶段（长 prompt 4.8x：31.9→6.7 ms/token）
 - [ ] **M2** Continuous Batching（多请求交织调度）
 - [ ] **M3** Radix Tree 前缀缓存复用
 - [ ] **M4** 自研 CUDA/Triton kernel 替换热点算子
