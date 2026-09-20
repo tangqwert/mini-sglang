@@ -59,9 +59,7 @@ def build_kv_forward(model, device: torch.device):
     def kv_forward(ids, cache): 
      with torch.no_grad():
            ids = ids.to(device)
-           input_ids = ids
-           past_key_values = cache
-           output = model(input_ids, past_key_values, use_cache = True)
+           output = model(input_ids=ids, past_key_values=cache, use_cache=True)
      return output.logits, output.past_key_values
     return kv_forward
 
