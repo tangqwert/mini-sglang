@@ -25,7 +25,11 @@ class FakeSeqCache:
 
 
 class IncrementModel:
-    """确定性假模型：下一 token = (上一个 token + 1) % VOCAB。
+    """确定性假模型：下一 token = (所有已见 token 之和) % VOCAB。
+
+    故意让输出依赖【完整上下文】而不只是最后一个 token——
+    否则"丢缓存"的实现也能蒙混过关（下一 token 只看最后 token 的模型，
+    有没有 cache 结果都一样）。上下文依赖是对 KV cache 的最小要求。
 
     eos_after 不为 None 时：最后一个 token == eos_after 则强制输出 EOS。
     tokens_fed 统计被喂进前向的 token 总数——这是 M1 性能契约的计量器。
@@ -42,10 +46,9 @@ class IncrementModel:
             full = input_ids
         else:
             full = torch.cat([past_key_values.ids, input_ids], dim=1)
-        last = full[:, -1]
-        next_tok = (last + 1) % VOCAB
+        next_tok = (full.sum(dim=1) + 1) % VOCAB  # 依赖完整上下文！
         if self.eos_after is not None:
-            hit = last == self.eos_after
+            hit = full[:, -1] == self.eos_after
             next_tok = torch.where(hit, torch.full_like(next_tok, EOS), next_tok)
         # 模仿 HF：返回每个输入位置的 logits，目标 token 编码成 one-hot
         logits = torch.full((full.shape[0], input_ids.shape[1], VOCAB), -10.0)
@@ -70,16 +73,17 @@ class TestCorrectness:
         out_naive = autoregressive_generate(naive_logits_fn(m_naive), prompt, cfg)
         out_kv = kv_generate(build_kv_forward(m_kv, "cpu"), prompt, cfg)
         assert torch.equal(out_naive, out_kv)
-        assert out_kv[0].tolist() == [5, 6, 7, 8, 9]
+        # 5 → (和=5, +1) → 6 → (和=11, →2) → 2 → 4 → 8
+        assert out_kv[0].tolist() == [5, 6, 2, 4, 8]
 
     def test_matches_naive_with_eos(self):
-        m_naive, m_kv = IncrementModel(eos_after=7), IncrementModel(eos_after=7)
+        m_naive, m_kv = IncrementModel(eos_after=6), IncrementModel(eos_after=6)
         prompt = torch.tensor([[5]])
         cfg = DecodingConfig(max_new_tokens=100, eos_token_id=EOS)
         out_naive = autoregressive_generate(naive_logits_fn(m_naive), prompt, cfg)
         out_kv = kv_generate(build_kv_forward(m_kv, "cpu"), prompt, cfg)
         assert torch.equal(out_naive, out_kv)
-        assert out_kv[0].tolist() == [5, 6, 7, 0]  # EOS 本身保留
+        assert out_kv[0].tolist() == [5, 6, 0]  # EOS 本身保留：6 之后强制出 EOS
 
     def test_batch_matches_naive(self):
         m_naive, m_kv = IncrementModel(), IncrementModel()
@@ -89,6 +93,9 @@ class TestCorrectness:
         out_kv = kv_generate(build_kv_forward(m_kv, "cpu"), prompt, cfg)
         assert torch.equal(out_naive, out_kv)
         assert out_kv.shape == (2, 4)
+        # 行1: 5→6→2→4；行2: 8→9→8→6
+        assert out_kv[0].tolist() == [5, 6, 2, 4]
+        assert out_kv[1].tolist() == [8, 9, 8, 6]
 
     def test_input_not_mutated(self):
         m_kv = IncrementModel()

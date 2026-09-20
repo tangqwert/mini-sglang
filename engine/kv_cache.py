@@ -62,7 +62,7 @@ def build_kv_forward(model, device: torch.device):
            input_ids = ids
            past_key_values = cache
            output = model(input_ids, past_key_values, use_cache = True)
-     return output.logits, cache
+     return output.logits, output.past_key_values
     return kv_forward
 
 
