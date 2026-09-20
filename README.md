@@ -7,7 +7,7 @@
 
 ## 里程碑
 
-- [ ] **M0** Naive 解码循环 + baseline 吞吐测量 ← 当前阶段
+- [x] **M0** Naive 解码循环 + baseline 吞吐测量 ← 当前阶段（179.2 tokens/s @ gpt2）
 - [ ] **M1** KV Cache（正确性对比 + 加速比）
 - [ ] **M2** Continuous Batching（多请求交织调度）
 - [ ] **M3** Radix Tree 前缀缓存复用
