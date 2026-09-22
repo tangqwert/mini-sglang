@@ -56,10 +56,14 @@ def build_kv_forward(model, device: torch.device):
     #   3. 调 model：input_ids=ids, past_key_values=cache, use_cache=True
     #        （cache 为 None 时 HF 会自动新建）
     #   4. 返回 (output.logits, output.past_key_values)
-    def kv_forward(ids, cache): 
+    def kv_forward(ids, cache, attention_mask = None, position_ids = None): 
      with torch.no_grad():
            ids = ids.to(device)
-           output = model(input_ids=ids, past_key_values=cache, use_cache=True)
+           if attention_mask is not None:                  # ← 新增
+               attention_mask = attention_mask.to(device)  # ← 新增
+           if position_ids is not None:                    # ← 新增
+               position_ids = position_ids.to(device)      # ← 新增
+           output = model(input_ids=ids, past_key_values=cache, use_cache=True, attention_mask = attention_mask, position_ids=position_ids)
      return output.logits, output.past_key_values
     return kv_forward
 

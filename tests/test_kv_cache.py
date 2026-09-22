@@ -40,13 +40,16 @@ class IncrementModel:
         self.eos_after = eos_after
         self.tokens_fed = 0
 
-    def __call__(self, input_ids, past_key_values=None, use_cache=False):
+    def __call__(self, input_ids, past_key_values=None, use_cache=False,
+                 attention_mask=None, position_ids=None):
         self.tokens_fed += input_ids.numel()
         if past_key_values is None:
             full = input_ids
         else:
             full = torch.cat([past_key_values.ids, input_ids], dim=1)
-        next_tok = (full.sum(dim=1) + 1) % VOCAB  # 依赖完整上下文！
+        if attention_mask is None:
+            attention_mask = torch.ones_like(full)
+        next_tok = ((full * attention_mask).sum(dim=1) + 1) % VOCAB  # 依赖完整上下文！
         if self.eos_after is not None:
             hit = full[:, -1] == self.eos_after
             next_tok = torch.where(hit, torch.full_like(next_tok, EOS), next_tok)
