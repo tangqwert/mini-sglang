@@ -1,30 +1,107 @@
-# mini-sglang：受 SGLang 启发的轻量级 LLM 推理引擎
+# mini-sglang
 
-> 一个用于学习 LLM 推理系统的教学项目：从最朴素的解码循环开始，
-> 逐步实现 KV Cache、Continuous Batching、Radix 前缀复用，
-> 最终用自研 CUDA/Triton kernel 替换热点算子。
-> 硬件：RTX 4070 Laptop (8GB) ｜ 模型：Qwen2.5-0.5B / GPT-2 124M
+**从零实现的轻量级 LLM 推理引擎** —— 参考 SGLang 架构，以 TDD 方式亲手构建推理系统的四层核心路径：解码循环 → KV Cache → Continuous Batching → Radix 前缀缓存。
 
-## 里程碑
+不是为了调用推理框架，而是为了回答一个问题：**vLLM/SGLang 到底在优化什么，为什么，以及优化在什么场景下不划算。**
 
-- [x] **M0** Naive 解码循环 + baseline 吞吐测量 ← 当前阶段（179.2 tokens/s @ gpt2）
-- [x] **M1** KV Cache（正确性对比 + 加速比）← 当前阶段（696-token prompt：29.2→6.5 ms/token，4.5x）
-- [x] **M2** Continuous Batching（多请求交织调度）← 当前阶段（4 请求批解码 vs 逐条：1.18x，输出逐 token 一致）
-- [x] **M3** Radix 前缀缓存复用 ← 当前阶段（3/3 输出一致；118-token 前缀实测 0.82x——小模型 prefill 被权重搬运主导，收益 < clone 开销，详见 docs/resume-project.md 分析）
-- [ ] **M4** 自研 CUDA/Triton kernel 替换热点算子
+- 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
+- 全程测试驱动：30 项单元/集成测试，每条优化路径都与朴素实现做逐 token 一致性验证
+
+## 30 秒上手
+
+```bash
+git clone https://github.com/tangqwert/mini-sglang && cd mini-sglang
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch transformers pytest
+
+# 1. 全部测试（单元 + 真模型集成）
+pytest tests/
+
+# 2. 看两条引擎的对比：同一长 prompt，朴素 vs KV Cache
+python -m benchmark.bench --engine naive --model gpt2 --max-new-tokens 128
+python -m benchmark.bench --engine kv    --model gpt2 --max-new-tokens 128
+
+# 3. 端到端验证脚本：批处理 / 前缀缓存 的正确性与收益
+python -m benchmark.verify_m2
+python -m benchmark.verify_m3
+```
+
+预期输出（KV Cache 路径）：
+
+```
+prompt tokens      : 5
+new tokens         : 128
+avg time/token     : 6.1 ms
+decode throughput  : 163.5 tokens/s
+```
+
+## 架构
+
+```
+┌─────────────────────────────────────────────┐
+│ benchmark/  bench.py(--engine naive|kv)     │  测量与验证
+│             verify_m2.py / verify_m3.py     │
+├─────────────────────────────────────────────┤
+│ engine/radix_cache.py   Radix 树前缀缓存     │  跨请求复用 KV
+│ engine/batching.py      动态退出批调度       │  多请求共享前向
+│ engine/kv_cache.py      增量解码(prefill+1)  │  免重复计算
+│ engine/naive_decode.py  朴素解码循环         │  基线（对照组）
+├─────────────────────────────────────────────┤
+│ transformers  (仅提供模型前向，禁用 generate) │
+└─────────────────────────────────────────────┘
+```
+
+核心设计：解码循环与模型**解耦**——循环只认识 `logits_fn` / `kv_forward` 这两个可调用对象，
+因此 M1/M2/M3 三次优化都没有改动循环本体，只替换了注入的前向实现。
+
+## 基准结果（RTX 4070 Laptop，fp32）
+
+| 优化 | 场景 | 结果 | 结论 |
+|---|---|---|---|
+| **KV Cache** | gpt2，601-token prompt | 29.2 → 6.5 ms/token（**4.5x**） | 消除序列长度维度的重复计算 |
+| KV Cache | Qwen2.5-0.5B，601-token prompt | 28.9 → 14.8 ms/token（**1.95x**） | 收益被权重搬运地板压缩 |
+| KV Cache | gpt2，5-token prompt | 5.8 → 6.1 ms/token（≈持平） | 短上下文无浪费可省 |
+| **Batching** | 4 请求批解码 vs 逐条 | 516 vs 606 ms（**1.18x**） | 收益 ∝ 请求数 × 权重搬运占比 |
+| **Radix 前缀缓存** | 3 请求共享 118-token 前缀 | **0.82x**（输出逐 token 一致） | 小模型 prefill 被权重搬运主导 |
+
+## 核心洞察：三个"理论收益 ≠ 实测收益"的对照实验
+
+每个里程碑都做了理论推导与实测的对照，三次实验共同指向同一条成本模型：
+
+```
+每步耗时 = 权重搬运（固定，∝模型大小） + 序列计算（∝上下文长度）
+```
+
+- **KV Cache** 省的是"序列计算"——模型越小、prompt 越长，收益越大（4.5x ↔ 1.95x 的差异由此而来）
+- **Batching** 省的是"N 条请求重复的权重搬运"——并发数上不去时收益有限（1.18x）
+- **Radix Cache** 省的是"跨请求重复的 prefill 计算"——小模型 prefill 本身 ≈5ms，被 clone 与 Python 开销反超（0.82x）；真实收益场景是大模型 × 长前缀 × 高命中率（SGLang 用 PagedAttention 的零拷贝页引用消除 clone 开销）
+
+**推论**：推理优化的收益 = 被省成分的成本 − 新增机制的开销。选型前先算清被省的部分在成本结构中占多少——这也是每个推理引擎的性能调优起点。
+
+## 与真 SGLang 的差距（诚实清单）
+
+| 能力 | mini-sglang | 真 SGLang |
+|---|---|---|
+| Radix 树节点分裂 | 部分重叠直接放弃插入（宁缺毋错） | 分裂节点，重叠段共享 |
+| 槽位补位（refill） | 无（完成的请求空转到批结束） | Continuous admission |
+| KV 显存管理 | 每请求整块 cache，clone 即拷贝 | PagedAttention 分页，零拷贝引用 |
+| 服务层 | 无（库形态） | HTTP Server + tokenizer manager |
+| Kernel | PyTorch 算子 | FlashInfer / 自研 CUDA |
 
 ## 开发方式
 
-TDD / 规格先行：`tests/` 定义行为契约，`engine/` 中的实现由学习者完成。
-每完成一个里程碑跑一次 benchmark，数据记入 `benchmark/results/`。
+TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-## 快速开始
+测试金字塔：27 项单元测试（毫秒级，假模型精确断言内部行为）+ 3 项真模型集成测试（GPT-2 前向，无 GPU 自动跳过）。
 
-```bash
-source .venv/bin/activate
-pytest tests/ -x            # 跑测试（M0 实现完成前应全红）
-python benchmark/bench.py --model Qwen/Qwen2.5-0.5B --max-new-tokens 128
-```
+## 路线图
+
+- [x] **M0** Naive 解码循环 + baseline（179 tokens/s @ gpt2）
+- [x] **M1** KV Cache 增量解码（4.5x @ 601-token prompt）
+- [x] **M2** Continuous Batching（动态退出批调度）
+- [x] **M3** Radix 前缀缓存复用
+- [ ] **M3.5** Radix 节点分裂（部分重叠序列的完整缓存）
+- [ ] **M4** 自研 CUDA/Triton kernel 替换热点算子
 
 ## 环境
 
@@ -34,3 +111,5 @@ pip install torch transformers pytest
 # 若报 "NVIDIA driver too old"，改装匹配驱动的版本：
 pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
+
+集成测试需要 GPU 与已下载的 `gpt2` 权重（自动缓存于 `~/.cache/huggingface`）。
