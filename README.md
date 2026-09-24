@@ -10,7 +10,7 @@
 - [x] **M0** Naive 解码循环 + baseline 吞吐测量 ← 当前阶段（179.2 tokens/s @ gpt2）
 - [x] **M1** KV Cache（正确性对比 + 加速比）← 当前阶段（696-token prompt：29.2→6.5 ms/token，4.5x）
 - [x] **M2** Continuous Batching（多请求交织调度）← 当前阶段（4 请求批解码 vs 逐条：1.18x，输出逐 token 一致）
-- [ ] **M3** Radix Tree 前缀缓存复用
+- [x] **M3** Radix 前缀缓存复用 ← 当前阶段（3/3 输出一致；118-token 前缀实测 0.82x——小模型 prefill 被权重搬运主导，收益 < clone 开销，详见 docs/resume-project.md 分析）
 - [ ] **M4** 自研 CUDA/Triton kernel 替换热点算子
 
 ## 开发方式
