@@ -4,6 +4,10 @@
 
 不是为了调用推理框架，而是为了回答一个问题：**vLLM/SGLang 到底在优化什么，为什么，以及优化在什么场景下不划算。**
 
+> ⚠️ **与官方同名项目的区分**：本仓库是**教学向**实现，与 SGLang 官方的
+> [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级 benchmark）**无代码或血缘关系**。
+> 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
+
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
 - 全程测试驱动：40 项测试，每条优化路径都与朴素实现做逐 token 一致性验证
   （M0–M3 共 32 项全绿；M4a 8 项中 6 项标 `xfail`，实现后自动转 XPASS 提醒摘标记）
@@ -90,6 +94,8 @@ decode throughput  : 163.5 tokens/s
 | 服务层 | 无（库形态） | HTTP Server + tokenizer manager |
 | Kernel | PyTorch 算子 | FlashInfer / 自研 CUDA |
 
+> 上表是精简版。**模块级对照（官方 15 个模块）、三层覆盖度评估、缺口清单与补充计划**见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
+
 ## 开发方式
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
@@ -101,11 +107,19 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M0** Naive 解码循环 + baseline（179 tokens/s @ gpt2）
 - [x] **M1** KV Cache 增量解码（4.5x @ 601-token prompt）
 - [x] **M2** Continuous Batching（动态退出批调度）
+- [ ] **M2.5** 调度器 + 槽位 refill（完成的行腾位、新请求立刻补入）
 - [x] **M3** Radix 前缀缓存复用
 - [ ] **M3.5** Radix 节点分裂（部分重叠序列的完整缓存）
 - [ ] **M4a** 分页 KV 池 + PagedAttention（按页表 gather，消除 M3 的 clone 开销）← 进行中
-- [ ] **M4b** 分页调度器（页表搬运 + 槽位 refill）
-- [ ] **M5** 自研 Triton/CUDA kernel（把 M4a 的 gather + 注意力翻译成 kernel）
+- [ ] **M4b** 分页显存管理（页表搬运 + 驱逐 / 抢占）
+- [ ] **M5** 自研 Triton kernel（把 M4a 的 gather + 注意力翻译成 kernel）★ 差异化重点
+- [ ] **M6** Chunked Prefill（长 prompt 切块前向，压显存峰值）
+- [ ] **M7** CUDA Graph（消除 decode 阶段的 kernel launch 开销）
+- [ ] **M8** 采样策略（temperature / top_p / top_k）
+- [ ] **M9** 最小 HTTP 服务（`/v1/chat/completions`）
+
+> 与 SGLang 官方 [mini-sglang](https://github.com/sgl-project/mini-sglang) 的模块级对照、覆盖度与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
+> **不计划实作**：Tensor Parallelism、Overlap Scheduling、ZMQ 多进程架构 —— 以读懂并讲清原理为目标。
 
 ## 环境
 
