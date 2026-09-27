@@ -64,11 +64,14 @@ decode throughput  : 163.5 tokens/s
 
 | 优化 | 场景 | 结果 | 结论 |
 |---|---|---|---|
-| **KV Cache** | gpt2，601-token prompt | 29.2 → 6.5 ms/token（**4.5x**） | 消除序列长度维度的重复计算 |
+| **KV Cache** | gpt2，696-token prompt | 29.2 → 6.5 ms/token（**4.5x**） | 消除序列长度维度的重复计算 |
 | KV Cache | Qwen2.5-0.5B，601-token prompt | 28.9 → 14.8 ms/token（**1.95x**） | 收益被权重搬运地板压缩 |
-| KV Cache | gpt2，5-token prompt | 5.8 → 6.1 ms/token（≈持平） | 短上下文无浪费可省 |
+| KV Cache | gpt2，5-token prompt | 5.8 → 6.1 ms/token（0.94x，略负） | 短上下文无浪费可省，机制开销反超 |
 | **Batching** | 4 请求批解码 vs 逐条 | 516 vs 606 ms（**1.18x**） | 收益 ∝ 请求数 × 权重搬运占比 |
 | **Radix 前缀缓存** | 3 请求共享 118-token 前缀 | **0.82x**（输出逐 token 一致） | 小模型 prefill 被权重搬运主导 |
+
+> 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
+> 由于两者的权重规模差 4x、地板效应本就主导，长度差异不影响结论方向；若要严格 apples-to-apples，需在相同长度下重跑。
 
 ## 核心洞察：三个"理论收益 ≠ 实测收益"的对照实验
 
@@ -105,7 +108,7 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 ## 路线图
 
 - [x] **M0** Naive 解码循环 + baseline（179 tokens/s @ gpt2）
-- [x] **M1** KV Cache 增量解码（4.5x @ 601-token prompt）
+- [x] **M1** KV Cache 增量解码（4.5x @ 696-token prompt）
 - [x] **M2** Continuous Batching（动态退出批调度）
 - [ ] **M2.5** 调度器 + 槽位 refill（完成的行腾位、新请求立刻补入）
 - [x] **M3** Radix 前缀缓存复用

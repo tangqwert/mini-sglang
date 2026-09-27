@@ -1,44 +1,104 @@
-# 简历项目模板 — mini-sglang
+# 简历投递包 — mini-sglang
 
-> 本文件是简历"项目经历"栏的素材库与纪律清单。
-> 原则：**每个数字都要能在 `benchmark/results/` 指认出处；每条 bullet 都要能扛住 10 分钟深挖。**
+> 用途：① 简历「项目经历」栏的直接素材；② 面试深挖的弹药库；③ 数字复核底账。
+> 纪律：**每个数字都能在 `benchmark/results/` 指认出处；每条 bullet 都要能扛住 10 分钟深挖。**
 
-## 简历条目（投递版）
+## 0. 一句话定位
 
-> **mini-sglang —— 从零实现的轻量级 LLM 推理引擎**（个人项目｜Python/PyTorch）
-> 参考 SGLang 架构，以 TDD 方式从零实现推理系统核心路径：解码循环 → KV Cache → 批处理 → 前缀缓存。
+从零手写轻量级 LLM 推理引擎，覆盖 **解码循环 → KV Cache → Continuous Batching → Radix 前缀缓存**；
+TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实测数据反推各优化的**收益边界**。
 
-- **KV Cache 增量解码**：基于注意力位置不变性实现 prefill + 增量前向，输出与朴素解码逐 token 一致；601-token 长 prompt 下每 token 耗时 29.2ms → 6.5ms（**4.5x**）
-- **跨模型瓶颈分析**：对照实验发现 KV Cache 收益受权重搬运地板效应压缩（Qwen2.5-0.5B 仅 **1.95x**），建立"每步耗时 = 权重搬运 + 序列计算"成本模型并实测验证
-- **Continuous Batching**：实现左填充 + attention mask + 位置编码对齐的多请求批解码与 per-request 动态退出，批量与逐条输出逐 token 一致
-- **Radix 前缀缓存**：实现 Radix 树管理跨请求 KV 复用，共享前缀请求的 prefill 计算量从 O(T) 降为 O(后缀)；TDD 全程，31 项单元/集成测试
+⚠️ **与官方同名项目的区分**：本仓库与 SGLang 官方的
+[sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级）
+**无代码或血缘关系**，交集只有 Radix Cache 一个概念。模块级对照见 [`official-vs-mine.md`](./official-vs-mine.md)。
 
-## Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
+## 1. 简历条目（投递版 · v1）
 
-| Bullet | 高概率追问 | 我的答案要点 |
-|---|---|---|
-| KV Cache | 为什么 decode 是 memory-bound？ | 每步搬全部权重（gpt2 fp32 0.5GB）；M0 数据：序列越长每步越慢（5.6→28.7ms） |
-| 4.5x 怎么测的 | 实验方法？ | 同一条 601-token prompt、预热 1 次、`torch.cuda.synchronize()` 包夹、naive/kv 同口径 |
-| 跨模型分析 | 为什么 Qwen 收益小？ | 成本公式：每步=权重搬运(固定)+序列计算(∝长度)；Qwen 权重 4x → 地板 ~15ms，实测 14.8ms 吻合 |
-| Batching | 为什么需要 attention mask / position_ids？ | 左填充的 pad 会污染注意力、打乱位置编号——踩过真 RuntimeError |
-| Radix | "命中缓存"的严谨定义？ | token 序列的精确公共前缀（非语义相似）；位置不变性 ⇒ KV 无损复用（误差 0.0 实验） |
-| Radix | 真 SGLang 和 mini 版差距？ | mini 不做节点分裂（部分重叠直接放弃插入）、不做 refill（需 PagedAttention 搬 KV）——知道差距在哪 |
+> **Mini-SGLang：从零实现轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch）
+> 2026.09 - 至今　github.com/tangqwert/mini-sglang
 
-## 上简历前 Checklist
+- **KV Cache 增量解码**：基于注意力位置不变性手写 prefill + 单 token 增量前向，输出与朴素解码逐 token 一致；
+  gpt2 696-token prompt 下 29.2 → 6.5 ms/token（**4.51x**）
+- **跨模型瓶颈分析**：对照实验发现收益被「权重搬运地板效应」压缩（Qwen2.5-0.5B 仅 **1.95x**，
+  短 prompt 反而 **0.94x 微负**），归纳出「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
+- **Continuous Batching**：实现左填充 + attention_mask + 显式 position_ids 的多请求批解码与
+  per-request 动态退出，4 请求批 516ms vs 逐条 606ms（**1.18x**），且与逐条输出逐 token 一致
+- **Radix 前缀缓存**：trie 前缀匹配 + KV 继承 + 收工回写，共享前缀请求的 prefill 计算量从 O(T) 降到 O(后缀)；
+  实测 **0.82x** —— 诚实报告负收益，并给出真实收益场景（大模型 × 长前缀 × 高命中率）
+- **测试驱动开发**：**32 项测试**（30 项假模型单元 + 2 项真模型集成），每项优化均与朴素实现做
+  逐 token 一致性验证，并用「喂入 token 数」精确账本断言开销
 
-- [ ] `pytest tests/` 全绿（M3 cached_generate 收官）
-- [ ] M3 真模型验证：共享前缀请求的 prefill 确实只算后缀
-- [ ] commit + push
-- [ ] README 升级：定位 / 架构图 / 结果表 / 快速开始（数字与本文件一致）
-- [ ] （可选）一键 demo：30 秒看到两条引擎对比
+> **v2（完成 M4a 后再追加这条）**：
+> - **PagedAttention**：分页 KV 池 + 按块表 gather + 多头缩放点积注意力，与连续存储参考实现逐元素一致（误差 < 1e-5）
 
-## 数据档案（防面试官复查，随里程碑更新）
+## 2. Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
+
+| 追问 | 我的答案要点 |
+|---|---|
+| **为什么 decode 是 memory-bound？** | 每步只算 1 个 token，但要把全部权重从 HBM 搬进 SM；计算量小、搬运量大 → 瓶颈在显存带宽。gpt2 fp32 权重 0.5GB，每步搬一遍 |
+| **4.5x 怎么测的？** | 同一条 696-token prompt、`--engine naive` / `--engine kv` 两条路径同口径；测 128 个新 token 的稳态耗时；**同一条 prompt 保证可比**（出处 `benchmark/results/*.json`） |
+| **⚠️ 你考虑 kernel launch 开销了吗？** | 一开始的模型漏了。后来把墙钟拆成 CUDA event（GPU 侧）与差值（CPU 侧：launch + Python + 框架），并注意到 M0 侧 attention 是 **O(T²)**，所以真实模型应是「固定项 + O(T) + O(T²)」三项。**待补**：用 T = 128/512/1024/2048 做 log-log 拟合斜率判定（计划中） |
+| **为什么 Qwen 收益小？** | 成本公式：每步 = 固定开销（权重搬运 + launch + Python）+ 序列计算（∝ 长度）。Qwen 权重 4x → 固定项大 → 收益被压缩（1.95x vs 4.51x），实测 14.8 ms/token 与推算吻合 |
+| **为什么短 prompt 反而变慢？** | 5-token prompt 时 0.94x。KV Cache 省下的序列计算 < 新增机制开销（cache 更新 + Python 循环 + 额外的前向调用）。**优化的收益 = 被省成分的成本 − 新增机制的开销**，这是我在三个里程碑里反复验证的结论 |
+| **为什么需要 attention_mask / position_ids？** | 左填充的 pad 若不被 mask 会污染注意力；pad 占位又打乱了位置编号。两者都是**踩过真 RuntimeError 后**才补上的 |
+| **「命中缓存」的严谨定义？** | token 序列的**精确公共前缀**（非语义相似）。依据是注意力的位置不变性 ⇒ 前缀的 K/V 可无损复用 |
+| **真 SGLang 和你的差距？** | **不分裂**（部分重叠直接放弃插入）、**无 refill**、**无驱逐**、**kernel 是 PyTorch**。完整清单见 `official-vs-mine.md` |
+
+## 3. 王牌素材：那个差 1 个 token 的 bug（面试用）
+
+**故事梗概**：M3 的 `cached_generate` 用 `radix.insert(ids + generated, cache)` 记账，但 cache 实际只覆盖到
+`generated[:-1]`（最后一个 token 的 K/V 要等下一次 forward 才进 cache）。树节点因此**多认领了 1 个 token**；
+后续请求「完整命中」时 `clone_cache_prefix` 会**静默截断**（张量切片不报错），丢掉最后一个 token 的 K/V → 输出错误。
+
+**为什么 30 项测试全绿仍漏掉**：现有测试的共享前缀都是 **partial hit**（如 `[1,2,3,4,5]` vs `[1,2,3,4,9]` 只命中 4 个），
+`use` 远小于 cache 长度 → 截断不触发。**没有任何测试让新请求「完整命中并继续延长」。**
+
+**修复**：`insert(ids + generated[:-1], cache)`（只声明 cache 真正覆盖的部分）+ 补 `test_full_prefix_match_extends`。
+
+**这段为什么值钱**：它同时证明三件事 —— ① 能发现深层 bug；② 理解测试盲区（**partial hit 测了，full hit 没测**）；
+③ 会诚实复盘。**比「我很努力」有说服力得多。**
+
+> 同类的第二个例子（M1）：`kv_generate` 的 prefill 步曾缺 EOS 判定，若首个 token 就是 EOS 会比 M0 多生成一个 token。
+> 也是边界盲区（**测了 EOS 在第 2 个 token，没测第 1 个**）。教训：**「与 X 逐 token 一致」的实现，盲区总在边界那一步。**
+
+## 4. 数据档案（防面试官复查）
 
 | 实验 | 数据 | 出处 |
 |---|---|---|
-| M1 KV cache（gpt2, 601 tok） | 29.2 → 6.5 ms/token，4.5x | `m0_naive_long.json` / `m1_kv_long.json` |
-| M1 KV cache（Qwen, 601 tok） | 28.9 → 14.8 ms/token，1.95x | `m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
-| M1 短 prompt（5 tok） | 5.8 → 6.1 ms/token，≈持平 | `m0_naive_short.json` / `m1_kv_short.json` |
-| M2 batching（4 请求） | 批 516ms vs 逐条 606ms，1.18x | `benchmark/verify_m2.py` |
-| M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出逐 token 一致 | `benchmark/verify_m3.py` |
-| M3 radix 耗时 | 0.82x——小模型 prefill ≈5ms 被权重搬运主导，省的计算 < clone/Python 开销；真收益场景=大模型×长前缀×高命中率（SGLang 用 PagedAttention 零拷贝引用解决 clone） | `benchmark/verify_m3.py` |
+| M1 KV cache（gpt2, **696** tok） | 3.739s → 0.828s；29.2 → 6.5 ms/token，**4.51x** | `m0_naive_long.json` / `m1_kv_long.json` |
+| M1 KV cache（Qwen2.5-0.5B, **601** tok） | 3.705s → 1.900s；28.9 → 14.8 ms/token，**1.95x** | `m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
+| M1 短 prompt（gpt2, **5** tok） | 0.738s → 0.783s；5.8 → 6.1 ms/token，**0.94x（微负）** | `m0_naive_short.json` / `m1_kv_short.json` |
+| M2 batching（4 请求） | 批 516ms vs 逐条 606ms，**1.18x** | `benchmark/verify_m2.py` |
+| M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出**逐 token 一致** | `benchmark/verify_m3.py` |
+| M3 radix 耗时 | **0.82x** —— 小模型 prefill ≈5ms 被权重搬运主导，省下的计算 < clone + Python 开销 | `benchmark/verify_m3.py` |
+
+> ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
+
+**测试统计**（`pytest tests/ --collect-only`）：
+
+| 范围 | 数量 |
+|---|---|
+| M0–M3 已完成 | **32**（30 假模型单元 + 2 真模型集成） |
+| M4a 脚手架 | 8（2 绿 + 6 `xfail`） |
+| 合计 | 40 |
+
+## 5. 上简历前 Checklist
+
+- [x] `pytest tests/` 全绿（34 passed, 6 xfailed）
+- [x] M1/M3 两处边界 bug 已修 + 回归测试已补
+- [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
+- [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）
+- [x] GitHub 定位声明（README 顶部，解决同名混淆）
+- [ ] GitHub About 栏补描述 + topics（`llm-inference` / `kv-cache` / `paged-attention` / `tutorial`）
+- [ ] （可选）完成 M4a → 追加 PagedAttention bullet（v2）
+- [ ] （投递期）性能建模修正版 → 追加建模 bullet（v3）
+
+## 6. 数字纪律（写简历前的自检）
+
+1. **不写没有出处的数**：每个 GFLOPS / ms / 倍数都要能指到 `benchmark/results/` 或 `verify_*.py`
+2. **不写没做完的功能**：M4a 未完成前不写 PagedAttention；SGEMM 没有数据前不写
+3. **不夸大技能**：技能栏写「正在学习 CUDA 并做算子练习」，不写「熟练」
+4. **不留占位符**：`xxx` / `待定` 一律不能出现在投递版
+5. **不写 AI 辅助工具**：`Cursor` / `Codex` / "Vibe Coding" 对 AI Infra 岗位是减分项
+6. **必写**：GitHub 链接 + 可实习时长（**可立即到岗，实习期 6 个月以上** —— 这是你的稀缺优势）
+
