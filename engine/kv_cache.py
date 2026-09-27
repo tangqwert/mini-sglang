@@ -23,8 +23,6 @@
   - kv_forward 返回 (logits, new_cache)，循环负责把 new_cache 传给下一步。
   - EOS 语义与 M0 完全一致：先拼接、后判定；批内任一命中即整批停。
 """
-from dataclasses import dataclass
-
 import torch
 
 from engine.naive_decode import DecodingConfig  # noqa: F401  (契约与 M0 共用)
@@ -49,22 +47,23 @@ def build_kv_forward(model, device: torch.device):
         - cache 的搬运问题想一想：ids 要 .to(device)，那 cache 呢？
           （它第一次由模型创建，之后一直住在哪？）
     """
-    # TODO(你): 返回一个闭包 kv_forward(ids, cache)。
-    # 骨架思路：
-    #   1. with torch.no_grad():
-    #   2. ids 搬到 device
-    #   3. 调 model：input_ids=ids, past_key_values=cache, use_cache=True
-    #        （cache 为 None 时 HF 会自动新建）
-    #   4. 返回 (output.logits, output.past_key_values)
-    def kv_forward(ids, cache, attention_mask = None, position_ids = None): 
-     with torch.no_grad():
-           ids = ids.to(device)
-           if attention_mask is not None:                  # ← 新增
-               attention_mask = attention_mask.to(device)  # ← 新增
-           if position_ids is not None:                    # ← 新增
-               position_ids = position_ids.to(device)      # ← 新增
-           output = model(input_ids=ids, past_key_values=cache, use_cache=True, attention_mask = attention_mask, position_ids=position_ids)
-     return output.logits, output.past_key_values
+    def kv_forward(ids, cache, attention_mask=None, position_ids=None):
+        # 唯一碰 model(...) 的入口：no_grad 与设备搬运都钉在这一层，
+        # 调用方不可能漏。cache 由模型创建、一直住在 model 的设备上，无需搬运。
+        with torch.no_grad():
+            ids = ids.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            if position_ids is not None:
+                position_ids = position_ids.to(device)
+            output = model(
+                input_ids=ids,
+                past_key_values=cache,
+                use_cache=True,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+        return output.logits, output.past_key_values
     return kv_forward
 
 
@@ -88,31 +87,19 @@ def kv_generate(kv_forward, input_ids: torch.LongTensor, config: DecodingConfig)
         - 不修改 input_ids 本身。
 
     提示:
-        - 结构 = prefill 一步 + 循环 (max_new_tokens - 1) 步。
-        - 每步都是：kv_forward → argmax(last) → cat → EOS 判定。
-          和 M0 循环体的唯一区别：喂的是 1 个 token 而非整条序列。
+        - 统一循环：feed 第 1 轮是整条 prompt，之后是上一步的 1 个新 token。
+          这样 EOS 判定天然只有一处——prefill 产出的第一个 token 也会被检查。
+        - 和 M0 循环体的唯一区别：喂的是 1 个 token 而非整条序列。
         - torch.cat 的返回值记得接住（你踩过两次的坑 😉）。
     """
-    # TODO(你): prefill + 增量循环。
     generated = input_ids.clone()
-    first_token, cached = kv_forward(generated, None)
-    first_token = torch.argmax(first_token[:,-1,:], dim= -1, keepdim= True)
-    generated = torch.cat((generated, first_token), dim=1)
-    # last_token = first_token
-
-    # for _ in range(config.max_new_tokens - 1):
-    #     logits, cached = kv_forward(last_token, cached)
-    #     next_token = torch.argmax(logits[:,-1,:] , dim= -1, keepdim= True)
-    #     generated = torch.cat((generated, next_token), dim = 1)
-    #     last_token = next_token
-    #     if config.eos_token_id != None and torch.any(next_token == config.eos_token_id):
-    #         break
-    # return generated
-
-    for _ in range(config.max_new_tokens -1):
-        logits, cached =  kv_forward(generated[:,-1:], cached)
-        next_token = torch.argmax(logits[:,-1,:], dim= -1, keepdim= True)
-        generated = torch.cat((generated, next_token), dim= 1)
-        if config.eos_token_id != None and torch.any(next_token == config.eos_token_id):
+    cache = None
+    feed = generated                  # 第 1 轮喂整条 prompt
+    for _ in range(config.max_new_tokens):
+        logits, cache = kv_forward(feed, cache)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated = torch.cat((generated, next_token), dim=1)
+        if config.eos_token_id is not None and torch.any(next_token == config.eos_token_id):
             break
+        feed = next_token             # 之后只喂 1 个新 token
     return generated

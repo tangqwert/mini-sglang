@@ -134,8 +134,7 @@ class RadixCache:
             while take < len(child.tokens) and hit + take < len(token_ids) \
                     and child.tokens[take] == token_ids[hit+take]:
                 take += 1
-            hit +=take
-            cache_hit = child.cache
+            hit += take
             if take < len(child.tokens):
                 partial = True
                 break
@@ -145,11 +144,8 @@ class RadixCache:
         if hit == len(token_ids):
             node.cache = cache
         else:
-            rest = token_ids[hit:] 
-            node.children[rest[0]] = RadixNode(tokens= rest, cache= cache)
-
-        # # TODO(你): 实现插入逻辑。
-        # raise NotImplementedError
+            rest = token_ids[hit:]
+            node.children[rest[0]] = RadixNode(tokens=rest, cache=cache)
 
 
 def cached_generate(kv_forward, requests: list[Request], radix: RadixCache) -> list:
@@ -177,7 +173,8 @@ def cached_generate(kv_forward, requests: list[Request], radix: RadixCache) -> l
         5. prefill：kv_forward(tensor([ids[use:]]), cache) —— 只喂未命中的后缀！
         6. M1 式解码循环（该请求自己的 max_new_tokens / eos_token_id）
         7. 收工：radix.insert(ids + 本条生成的 token, cache)
-           （此刻 cache 覆盖的正是 ids+generated 的完整 KV）
+           （注意：cache 只覆盖到 ids+generated[:-1]——最后一个 token 的 K/V
++             要等下一次 forward 才会进 cache。所以这里也必须少记 1 个。）
 
     提示:
         - 张量与 list 的转换：prompt 是 [1, T] 张量 → ids = prompt[0].tolist()
@@ -213,10 +210,8 @@ def cached_generate(kv_forward, requests: list[Request], radix: RadixCache) -> l
             generated.append(next_token[0,0].item())
             frozen = (r.eos_token_id is not None and generated[-1] == r.eos_token_id) \
                         or len(generated) >= r.max_new_tokens
-        radix.insert(ids + generated, cache)
-        outs.append(torch.cat([r.prompt.reshape(1,-1),
-                               torch.tensor([generated], dtype= torch.long,
-                                            device= r.prompt.device)], dim=1))  
+        radix.insert(ids + generated[:-1], cache)
+        outs.append(torch.cat([r.prompt.reshape(1, -1),
+                               torch.tensor([generated], dtype=torch.long,
+                                            device=r.prompt.device)], dim=1))
     return outs
-    # # TODO(你): 查树 → 继承 → 算后缀 → 解码 → 回写。
-    # raise NotImplementedError

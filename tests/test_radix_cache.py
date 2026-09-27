@@ -11,6 +11,7 @@ from transformers import DynamicCache
 from engine.naive_decode import DecodingConfig, autoregressive_generate
 from engine.batching import Request
 from engine.radix_cache import RadixCache, cached_generate, clone_cache_prefix
+from engine.kv_cache import build_kv_forward
 from test_kv_cache import IncrementModel, naive_logits_fn, VOCAB, EOS
 
 
@@ -120,7 +121,6 @@ class TestCachedGenerate:
             Request(req_id=1, prompt=torch.tensor([[1, 2, 3, 4, 9]]), max_new_tokens=3),
             Request(req_id=2, prompt=torch.tensor([[7, 8]]), max_new_tokens=2),
         ]
-        from engine.kv_cache import build_kv_forward  # noqa
         kv_forward = build_kv_forward(m_cache, "cpu")
         outs = cached_generate(kv_forward, reqs, RadixCache())
 
@@ -140,14 +140,12 @@ class TestCachedGenerate:
             Request(req_id=0, prompt=torch.tensor([[1, 2, 3, 4, 5]]), max_new_tokens=3),
             Request(req_id=1, prompt=torch.tensor([[1, 2, 3, 4, 9]]), max_new_tokens=3),
         ]
-        from engine.kv_cache import build_kv_forward  # noqa
         cached_generate(build_kv_forward(m, "cpu"), reqs, RadixCache())
         assert m.tokens_fed == 7 + 3, f"实际 {m.tokens_fed}——共享前缀没有被省掉？"
 
     def test_tree_grows_across_requests(self):
         """每条请求收工后回写：下一条能查到它的前缀。"""
         m = CacheSumModel()
-        from engine.kv_cache import build_kv_forward  # noqa
         radix = RadixCache()
         reqs = [
             Request(req_id=0, prompt=torch.tensor([[1, 2, 3, 4, 5]]), max_new_tokens=2),
@@ -156,3 +154,20 @@ class TestCachedGenerate:
         cached_generate(build_kv_forward(m, "cpu"), reqs, radix)
         hit, _ = radix.match_prefix(reqs[1].prompt[0].tolist())
         assert hit == 5, "第二条请求应命中第一条存进树的完整 prompt"
+
+    def test_full_prefix_match_extends(self):
+        """被后续请求【完整命中并延长】时必须逐 token 一致。
+
+        曾漏：cache 比 generated 少 1 个 token，insert 却按整条序列记账，
+        clone_cache_prefix 静默截断 → 丢最后一个 token 的 K/V。
+        （partial hit 场景由 test_outputs_equal_naive 覆盖，本用例补 full hit。）
+        """
+        radix = RadixCache()
+        kf = build_kv_forward(CacheSumModel(), "cpu")
+        seq0 = cached_generate(kf, [Request(req_id=0, prompt=torch.tensor([[1, 2, 3]]),
+                                        max_new_tokens=2)], radix)[0][0].tolist()
+        prompt1 = seq0 + [7]          # 完整命中 req0 存进树的前缀，再多一个 token
+        got = cached_generate(kf, [Request(req_id=1, prompt=torch.tensor([prompt1]),
+                                        max_new_tokens=2)], radix)[0]
+        want = per_request_naive(CacheSumModel(), torch.tensor([prompt1]), 2)
+        assert torch.equal(got, want), (got.tolist(), want.tolist())

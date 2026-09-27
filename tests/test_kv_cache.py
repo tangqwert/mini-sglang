@@ -88,6 +88,20 @@ class TestCorrectness:
         assert torch.equal(out_naive, out_kv)
         assert out_kv[0].tolist() == [5, 6, 0]  # EOS 本身保留：6 之后强制出 EOS
 
+    def test_eos_on_first_token(self):
+        """边界：第 1 个 token 就是 EOS 时，prefill 之后也必须判定。
+
+        曾漏：prefill 步没有 EOS 判定，M1 会比 M0 多生成一个 token。
+        （test_matches_naive_with_eos 的 EOS 落在第 2 个 token，覆盖不到这里。）
+        """
+        m_naive, m_kv = IncrementModel(eos_after=5), IncrementModel(eos_after=5)
+        prompt = torch.tensor([[5]])          # 最后一个 token == eos_after → 首 token 即 EOS
+        cfg = DecodingConfig(max_new_tokens=10, eos_token_id=EOS)
+        out_naive = autoregressive_generate(naive_logits_fn(m_naive), prompt, cfg)
+        out_kv = kv_generate(build_kv_forward(m_kv, "cpu"), prompt, cfg)
+        assert torch.equal(out_naive, out_kv)
+        assert out_kv[0].tolist() == [5, EOS]
+
     def test_batch_matches_naive(self):
         m_naive, m_kv = IncrementModel(), IncrementModel()
         prompt = torch.tensor([[5], [8]])
