@@ -131,7 +131,6 @@ def batched_generate(
         4. 收尾：按 requests 顺序返回 prompt 拼生成（注意用原始 prompt，
            不是 padded！padded 里混着 pad）
     """
-    # TODO(你): 实现调度循环。
     n = len(requests)
     padded, mask = pad_left(requests, pad_token_id)
 
