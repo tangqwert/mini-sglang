@@ -8,7 +8,8 @@ import torch
 
 from engine.naive_decode import DecodingConfig, autoregressive_generate
 from engine.kv_cache import build_kv_forward
-from engine.batching import Request, batched_generate, pad_left, build_position_ids
+from engine.batching import (Request, batched_generate, continuous_generate,
+                             pad_left, build_position_ids)
 
 # 复用 M1 的假模型（已升级为 mask 感知：上下文和 = (full * mask).sum）
 from test_kv_cache import IncrementModel, naive_logits_fn, VOCAB, EOS
@@ -102,3 +103,96 @@ class TestHelpers:
         # 行 2 的真实 token 7 的位置应是 0（不是 2）——pad 不占位置
         assert pos[0].tolist() == [0, 1, 2]
         assert pos[1].tolist() == [0, 0, 0]
+
+
+class TestContinuous:
+    """M2.5：槽位连续准入 —— 空出的槽位立刻补入下一条请求。
+
+    关键契约有两条：
+      ① 正确性不变：每条请求的输出仍与单独跑朴素解码逐 token 一致
+        （补入是通过"左填充到当前批长 + 单独 prefill + 拷行"实现的，
+         因果注意力逐行独立 ⇒ 与"一开始就在批里"数值等价）
+      ② 收益有代价：省下的是"冻结行空转"，付出的是"补入需要独立前向"
+    """
+
+    def _assert_all_match(self, reqs, batch_size, model=None):
+        model = model or IncrementModel()
+        outs, stats = continuous_generate(build_kv_forward(model, "cpu"), reqs,
+                                          max_batch_size=batch_size)
+        for got, r in zip(outs, reqs):
+            want = per_request_naive(IncrementModel(), r)
+            assert torch.equal(got, want), (r.req_id, got.tolist(), want.tolist())
+        return stats
+
+    def test_no_refill_needed_when_batch_fits(self):
+        """请求数 <= 槽位数：不需要补入，行为应与 M2 一致。"""
+        reqs = [
+            Request(req_id=0, prompt=torch.tensor([[5]]), max_new_tokens=4),
+            Request(req_id=1, prompt=torch.tensor([[3, 4]]), max_new_tokens=3),
+            Request(req_id=2, prompt=torch.tensor([[9]]), max_new_tokens=2),
+        ]
+        stats = self._assert_all_match(reqs, batch_size=4)
+        assert stats.admissions == 0
+        assert stats.steps == 3          # 最长预算 4 → prefill + 3 步
+
+    def test_refill_when_queue_exceeds_slots(self):
+        """请求数 > 槽位数：必须发生补入，且结果仍逐 token 一致。"""
+        reqs = [
+            Request(req_id=0, prompt=torch.tensor([[5]]), max_new_tokens=4),
+            Request(req_id=1, prompt=torch.tensor([[3, 4]]), max_new_tokens=3),
+            Request(req_id=2, prompt=torch.tensor([[9]]), max_new_tokens=2),
+            Request(req_id=3, prompt=torch.tensor([[1, 2, 3]]), max_new_tokens=5),
+        ]
+        stats = self._assert_all_match(reqs, batch_size=2)
+        assert stats.admissions == 2, "4 条请求 / 2 个槽位 → 应补入 2 次"
+        assert stats.padded_positions > 0, "补入靠左填充，必然产生填充位置"
+
+    def test_batch_size_one(self):
+        """退化情形：单槽位也必须正确（等价于逐条串行）。"""
+        reqs = [
+            Request(req_id=0, prompt=torch.tensor([[5]]), max_new_tokens=2),
+            Request(req_id=1, prompt=torch.tensor([[7]]), max_new_tokens=3),
+        ]
+        stats = self._assert_all_match(reqs, batch_size=1)
+        assert stats.admissions == 1
+        assert stats.idle_slot_steps == 0, "单槽位时不该有空转"
+
+    def test_eos_freezes_slot_and_frees_it(self):
+        """命中 EOS 的行立刻释放槽位，把机会让给后面的请求。"""
+        reqs = [
+            Request(req_id=0, prompt=torch.tensor([[9]]), max_new_tokens=50, eos_token_id=EOS),
+            Request(req_id=1, prompt=torch.tensor([[5]]), max_new_tokens=3),
+        ]
+        stats = self._assert_all_match(reqs, batch_size=1, model=IncrementModel(eos_after=7))
+        # prompt=[9] 首步即命中 EOS=0 → 释放槽位 → 补入 req1
+        assert stats.admissions == 1
+
+    def test_beats_static_chunking_on_forward_count(self):
+        """收益契约：连续准入的总前向次数 < 静态分批。
+
+        静态分批（每 B 条一组跑到底）的前向次数 = Σ 各组 max(预算)。
+        连续准入的前向次数 = 批量步数 + 补入前向次数。
+        """
+        budgets = [1, 5, 1, 5]
+        reqs = [Request(i, torch.tensor([[5]]), n) for i, n in enumerate(budgets)]
+        _, stats = continuous_generate(build_kv_forward(IncrementModel(), "cpu"),
+                                       reqs, max_batch_size=2)
+
+        static_forwards = sum(max(budgets[k:k + 2]) for k in range(0, len(budgets), 2))
+        continuous_forwards = stats.steps + stats.admission_forwards
+        assert continuous_forwards < static_forwards, (continuous_forwards, static_forwards)
+
+    def test_empty_requests(self):
+        outs, stats = continuous_generate(build_kv_forward(IncrementModel(), "cpu"), [])
+        assert outs == [] and stats.steps == 0
+
+    def test_prompts_not_mutated(self):
+        reqs = [
+            Request(req_id=0, prompt=torch.tensor([[5]]), max_new_tokens=2),
+            Request(req_id=1, prompt=torch.tensor([[3, 4]]), max_new_tokens=3),
+            Request(req_id=2, prompt=torch.tensor([[1, 2, 3]]), max_new_tokens=2),
+        ]
+        before = [r.prompt.clone() for r in reqs]
+        continuous_generate(build_kv_forward(IncrementModel(), "cpu"), reqs, max_batch_size=2)
+        for r, b in zip(reqs, before):
+            assert torch.equal(r.prompt, b)

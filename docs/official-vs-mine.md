@@ -42,7 +42,7 @@
 |---|---|---|---|
 | `core` — `Req` / `Batch` / `Context` / `SamplingParams` | `engine/batching.py:Request` | ⚠️ | 只有简化 `Request`；**无全局 `Context`**；**无采样参数**（仅贪心） |
 | `engine` — `Engine` 类（model + ctx + kv + attn + cudagraph） | `engine/*.py`（函数式） | ⚠️ | 无 `Engine` 对象、无语境管理；**无 CUDA Graph** |
-| `scheduler` — 每 TP rank 一个 `Scheduler` | `engine/batching.py:batched_generate` | ⚠️ M2 | **无槽位 refill、无 Chunked Prefill、无抢占**；请求列表是静态的 |
+| `scheduler` — 每 TP rank 一个 `Scheduler` | `engine/batching.py`（`batched_generate` + `continuous_generate`） | ✅ M2 / M2.5 | **有连续准入**（冻结行腾位、pending 补入）；但补入需一次独立前向 + 左填充碎片。**无 Chunked Prefill、无抢占** |
 | `llm` — `LLM` python 接口 | `benchmark/bench.py`（脚本） | ⚠️ | 无统一入口类 |
 | 显存管理（驱逐 / 抢占 / refcount / LRU） | — | ❌ | M4b 计划中 |
 | `tokenizer` — tokenize/detokenize worker | —（调用侧直接用 HF） | ❌ | 无独立 worker |
@@ -66,7 +66,7 @@
 | 层次 | 覆盖度 | 判断依据 |
 |---|---|---|
 | **算法 / 数据结构**（算得对） | **~70%** | M0–M4a 正好覆盖这条线，且有测试与实测分析 |
-| **单机系统**（服务得起来） | **~20%** | 有 batching，缺调度器、显存管理、服务层 |
+| **单机系统**（服务得起来） | **~30%** | 有 batching + 连续准入，缺显存管理、服务层 |
 | **并行 / 工程**（多卡、多进程） | **0%** | 单卡单进程，无 TP / ZMQ / CUDA Graph |
 
 **三条缺口规律**：
@@ -93,7 +93,7 @@
 
 | 里程碑 | 内容 | 为什么 |
 |---|---|---|
-| **M2.5** | 调度器 + 槽位 refill | 补上 M2 缺的那半边：完成的行腾出槽位、新请求立刻补入 —— 这才是真正的 continuous batching |
+| **M2.5** ✅ | 调度器 + 槽位连续准入 | 已完成。**发现**：没有 PagedAttention 时，补入一条新请求需要一次独立前向 + 左填充碎片，把理想收益从 2.00x 压到 1.25x —— 这是 M4a 的直接动机 |
 | **M4b** | 分页显存管理（页表搬运 + 驱逐 / 抢占） | M4a 只是"能分页"，M4b 才"会管理" |
 | **M8** | 采样策略（temperature / top_p / top_k） | 几十行，但让"生成"完整；面试高频话题 |
 | **M9** | 最小 HTTP 服务（`/v1/chat/completions`） | 让项目可演示（录屏 / 简历链接） |
@@ -115,7 +115,7 @@
 M0   解码循环                              ✅
 M1   KV Cache                              ✅
 M2   Continuous Batching（动态退出）        ✅
-M2.5 调度器 + 槽位 refill                   ⬜ P1
+M2.5 调度器 + 槽位连续准入                  ✅
 M3   Radix 前缀缓存（mini 版）              ✅
 M3.5 Radix 节点分裂 + 驱逐                  ⬜
 M4a  分页 KV 池 + PagedAttention           🚧
