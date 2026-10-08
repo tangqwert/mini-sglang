@@ -202,6 +202,30 @@ def ensure_blocks(pool: PagedKVPool, block_table: list, total_len: int) -> None:
     while len(block_table) < need:
         block_table.append(pool.allocate())
 
+def scatter_kv(pool: PagedKVPool, layer: int, table_t: torch.Tensor,
+               base: int, k: torch.Tensor, v: torch.Tensor) -> None:
+    """把一段连续的 K/V 一次性写进分页池（向量化，M5 第①级）。
+
+    逐 token 的 Python 循环在 prefill 时是灾难：一条 153-token 的 prompt
+    每层要转 153 次 × 12 层 —— 纯粹的 CPU 开销，跟算力无关。
+    这里换成一次高级索引赋值（底层就是一个 index_put_ kernel）：
+
+        绝对位置 p → 块 table_t[p // bs] 的第 p % bs 个槽位
+
+    Args:
+        table_t: 该序列的页表（int64 张量，已在 device 上）
+        base: 这段 K/V 的起始【绝对位置】
+        k, v: [n, num_heads, head_dim] —— 只含该序列这一段，且已转成
+              (token, head, dim) 布局
+    """
+    n = k.shape[0]
+    if n == 0:
+        return
+    pos = torch.arange(base, base + n, device=k.device)
+    blk = table_t[pos // pool.block_size]
+    slot = pos % pool.block_size
+    pool.keys[layer, blk, slot] = k
+    pool.values[layer, blk, slot] = v
 
 class BatchedPagedAttentionHook:
     """多序列（varlen / ragged batch）分页注意力钩子。
@@ -236,6 +260,9 @@ class BatchedPagedAttentionHook:
             f"参数不对齐：block_tables={len(self.block_tables)}, "
             f"bases={len(self.base)}, new_lens={self.n_seq}")
         self.written = [b + n for b, n in zip(self.base, self.new_lens)]
+        # 页表转成张量（S× 只做一次，而不是每层每 token 再转）
+        self.bt = [torch.as_tensor(t, dtype=torch.long, device=pool.keys.device)
+                   for t in self.block_tables]
         # 每条序列在拍平维度上的起点（cu_seqlens）
         self.cu = [0]
         for n in self.new_lens:
@@ -248,18 +275,17 @@ class BatchedPagedAttentionHook:
             f"拍平长度对不上：前向给了 {S_total}，页表声明 {self.cu[-1]}"
         bs = self.pool.block_size
 
-        # ① 写：各序列的新 token 落到各自页表的对应槽位
+        # ① 写：各序列的新 token 落到各自页表的对应槽位（向量化，一次索引赋值/序列）
         #    （绝对位置 p → 第 p // bs 块的第 p % bs 槽；每层都写）
         for s in range(self.n_seq):
             b, n, tbl = self.base[s], self.new_lens[s], self.block_tables[s]
             assert len(tbl) * bs >= b + n, \
                 f"序列 {s} 页表容量不足（{len(tbl) * bs} < {b + n}）：请先 ensure_blocks"
-            for t in range(n):
-                p = b + t
-                self.pool.write(layer_idx, tbl[p // bs], p % bs,
-                                k[0, :, self.cu[s] + t, :],
-                                v[0, :, self.cu[s] + t, :])
-                self.kv_writes += 1
+            a = self.cu[s]
+            scatter_kv(self.pool, layer_idx, self.bt[s], b,
+                       k[0, :, a:a + n, :].transpose(0, 1),
+                       v[0, :, a:a + n, :].transpose(0, 1))
+            self.kv_writes += n
 
         # ② 逐序列 gather，再逐 query 算注意力
         #    （query 的绝对位置 base+t 只能看到 key 的 0..base+t —— 因果性）

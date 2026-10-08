@@ -32,9 +32,9 @@
 | `kvcache` — `NaiveCacheManager` | `engine/kv_cache.py` | ✅ | 我直接用 HF `past_key_values`，未抽管理器接口 |
 | `kvcache` — `RadixCacheManager` | `engine/radix_cache.py` | ⚠️ | **无节点分裂、无驱逐、无 refcount**（mini 版放弃部分重叠插入） |
 | `kvcache` — `MHAKVCache`（分页池） | `engine/paged_kv.py` | ✅ M4a | 手写 PyTorch 版（gather 三步 + 多头点积）；官方在 CUDA kernel 内完成 gather |
-| `attention` — 后端抽象（fa / fi / trtllm） | `engine/paged_kv.py:paged_attention` | ⚠️ M4a | **无后端抽象层**；无 FlashAttention / FlashInfer 集成 |
-| `kernel` — 自研 CUDA（tvm-ffi + JIT） | — | ⬜ M5 | 我计划用 **Triton**，不引入 tvm-ffi |
-| `benchmark` | `benchmark/bench.py`、`verify_m2.py`、`verify_m3.py` | ✅ | 官方测吞吐/延迟；我额外做**逐 token 一致性**与 **`tokens_fed` 精确账本** |
+| `attention` — 后端抽象（fa / fi / trtllm） | `engine/paged_kv.py:paged_attention` | ⚠️ M4a | **无后端抽象层**；无 FlashAttention / FlashInfer 集成，但自研 kernel 已就位（M5） |
+| `kernel` — 自研 CUDA（tvm-ffi + JIT） | `engine/triton_paged.py` | ✅ M5 | 用 **Triton** 而非 tvm-ffi+CUDA；实现了分页版 flash attention（查页表 + 因果掩码 + online softmax），**无 split-K** |
+| `benchmark` | `benchmark/bench.py`、`verify_m2/m3/m4b/m5/m6.py` | ✅ | 官方测吞吐/延迟；我额外做**逐 token 一致性**与 **`tokens_fed` 精确账本** |
 
 ### 单机系统层（缺口最大）
 
@@ -75,7 +75,11 @@
 2. 覆盖了「**单次计算的效率**」，缺「**系统级效率**」——CPU 侧开销（Overlap / CUDA Graph）与显存峰值（Chunked Prefill / 驱逐）。
 3. 走了「算法 → 访存 → kernel」这条线，没碰「分布式 → 服务化」那条线。
 
-> **根本原因**：当 kernel 足够快时，瓶颈会从「算得慢」转移到「CPU 调度」与「显存管理」。本项目仍停留在 PyTorch 算子层，计算本身是瓶颈，所以系统级优化还看不到收益 —— 这也解释了 bench 中反复出现的"地板效应"。
+> **根本原因**：当 kernel 足够快时，瓶颈会从「算得慢」转移到「CPU 调度」与「显存管理」。本项目在 M4b 之前停留在 PyTorch 算子层，计算本身是瓶颈，所以系统级优化看不到收益 —— 这也解释了 bench 中反复出现的"地板效应"。
+>
+> **M4b/M5/M6 把这个判断逐条验证了**：分页 + varlen 把喂入 token 降了 6.6 倍，墙钟却慢了 2 倍
+> （瓶颈真的转到了 CPU 侧）；换成 Triton kernel 后才追平（565 → 301 ms）。
+> 所以下一步的收益点已经不在算法，而在 **CPU 调度（M7 CUDA Graph）** 与 **kernel 并行度（M5.5 split-K）**。
 
 ---
 
@@ -85,8 +89,9 @@
 
 | 里程碑 | 内容 | 为什么 |
 |---|---|---|
-| **M5** | Triton kernel：把 M4a 的 `gather_layer` + `paged_attention` 翻译成 kernel | 本项目最具面试价值的一块：能讲清 PagedAttention 的访存模式，而非"我调了 FlashInfer" |
-| **M6** | Chunked Prefill（长 prompt 切块 prefill） | 算法简单，但引出**显存峰值管理**这一系统级概念；与 M4b 天然衔接 |
+| **M5** ✅ | Triton kernel：把 M4a 的 `gather_layer` + `paged_attention` 翻译成 kernel | 已完成（`engine/triton_paged.py`）。端到端 1.88x，输出与 PyTorch 后端逐 token 一致 |
+| **M5.5** | split-K / flash-decoding | 我的 kernel 单序列只有 H 个 program，SM 大量空转 —— 这是 M5 量化出的下一个瓶颈 |
+| **M6** ✅ | Chunked Prefill（长 prompt 切块 + prefill/decode 合流） | 已完成。总前向 37 → 30，补入独立前向 7 → 0 |
 | **M7** | CUDA Graph（捕获 / 重放 decode 步） | 代码量小，概念极重要：decode 阶段 kernel launch 开销可占大头 |
 
 ### P1 — 该补（让项目"完整、可演示"）
@@ -94,7 +99,7 @@
 | 里程碑 | 内容 | 为什么 |
 |---|---|---|
 | **M2.5** ✅ | 调度器 + 槽位连续准入 | 已完成。**发现**：没有 PagedAttention 时，补入一条新请求需要一次独立前向 + 左填充碎片，把理想收益从 2.00x 压到 1.25x —— 这是 M4a 的直接动机 |
-| **M4b** | 分页显存管理（页表搬运 + 驱逐 / 抢占） | M4a 只是"能分页"，M4b 才"会管理" |
+| **M4b** ✅ | 分页调度器（页表 + varlen + 零填充） | 已完成（含连续准入与 M6 合流）。**仍缺**：驱逐 / 抢占（池子耗尽时直接报错） |
 | **M8** | 采样策略（temperature / top_p / top_k） | 几十行，但让"生成"完整；面试高频话题 |
 | **M9** | 最小 HTTP 服务（`/v1/chat/completions`） | 让项目可演示（录屏 / 简历链接） |
 
@@ -119,9 +124,10 @@ M2.5 调度器 + 槽位连续准入                  ✅
 M3   Radix 前缀缓存（mini 版）              ✅
 M3.5 Radix 节点分裂 + 驱逐                  ⬜
 M4a  分页 KV 池 + PagedAttention           ✅
-M4b  分页调度器（页表 + 抢占）              ⬜ P1
-M5   Triton kernel（gather + attention）   ⬜ P0 ★
-M6   Chunked Prefill                       ⬜ P0
+M4b  分页调度器（页表 + varlen + 零填充）   ✅
+M5   Triton kernel（分页 flash attention）✅ 端到端 1.88x
+M5.5 split-K / flash-decoding              ⬜ P0 ★
+M6   Chunked Prefill（prefill/decode 合流）✅
 M7   CUDA Graph                            ⬜ P0
 M8   采样策略（temperature / top_p）        ⬜ P1
 M9   最小 HTTP 服务                         ⬜ P1

@@ -46,7 +46,12 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
   + 新序列一大块 prompt（prefill）”。总前向次数 37 → **30**、补入独立前向 7 → **0**、
   prefill/decode 同批 7 步；再用 `max_prefill_tokens`（对应 vLLM 的
   `max_num_batched_tokens`）给单步成本设上限（单步 token 峰值 157 → 16），把 ITL 摊平
-- **测试驱动开发**：**98 项测试全部通过**（56 项假模型单元 + 42 项真模型），
+- **自研 Triton 分页注意力 kernel（M5）**：把「查页表 gather + 因果掩码 + online softmax
+  + 加权求和」封进**一个** kernel（即分页版 flash attention）——PyTorch 版每层要起十来个
+  kernel 加一圈 Python 循环，Triton 版每层只剩 2 个（1 写 + 1 算）。端到端
+  **565 → 301 ms（1.88x）**，且输出与调度统计与 PyTorch 后端**完全一致**
+  （严格 fp32、不开 TF32，实测 max|diff| ~3e-7）
+- **测试驱动开发**：**129 项测试全部通过**（77 项假模型/纯张量单元 + 52 项真模型），
   每项优化均与朴素实现做逐 token 一致性验证，并用「喂入 token 数」精确账本断言开销
 
 ## 2. Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
@@ -62,7 +67,9 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | **连续准入怎么实现的？为什么要"拷 cache 行"？** | HF 的批 cache 要求**所有行等长**，所以一条长度不同的新请求没法直接插进去。技巧是：把它左填充到当前批长 → 单独 prefill 一次拿到它自己的 K/V → 再把那一行拷进空槽。因果注意力逐行独立 ⇒ 与"它一开始就在批里"数值等价（实测 logits 差 < 4e-5） |
 | **那为什么收益只有 1.25x（理想 2.00x）？** | 两笔代价：① 补入要算 S 个填充位置（S ≈ 当前批长）；② 补入要多开**一次独立前向**。**分两步修完**：M4b 用分页 + varlen 消掉①（喂入 token 1463 → 222），M6 把 prefill 与 decode 合流消掉②（总前向 37 → 30，补入独立前向 7 → **0**）。**能把这个坑拆成两半分别验证，比报一个加速比更有说服力** |
 | **Chunked Prefill 是什么？为什么要 chunk？** | 把 prompt 切块、与 decode 合进同一步。不 chunk 的话一条 4096-token prompt 独占一步，这一步算力是别人的 4096 倍 → 其他请求的 ITL 被打爆。用 `max_prefill_tokens` 设上限后单步峰值 **157 → 16 token**，代价是前向次数变多（总计算量不变）。分块的正确性靠两点：**绝对位置跨块连续** + 后续块能看到前面块（已在池里，gather 天然满足）；我用 **chunk=1** 做了最狠的压力测试 |
-| **⚠️ 那分页路径墙钟反而更慢？** | 喂入 token 降 6.6 倍，墙钟 **306 → 624ms**。因为逐序列注意力是 Python 循环（每序列 × 每 query 位置一次调用），而 M2.5 用的是 HF 融合好的批式注意力。**这正是 M5 的动机**：把三层循环翻译成 Triton kernel，才把算力优势兼现成墙钟优势 |
+| **⚠️ 那分页路径墙钟反而更慢？** | 确实曾经更慢：喂入 token 降 6.6 倍，墙钟 **306 → 624ms**。因为逐序列注意力是 Python 循环（每序列 × 每 query 位置 × 每层十来个 kernel），而 M2.5 用的是 HF 融合好的批式注意力。**于是我写了 M5**：Triton kernel 把这一段折成 1 个 kernel，端到端 **565 → 301ms（1.88x）**，墙钟追平 M2.5 而 token 数低 6.6 倍 |
+| **Triton kernel 具体怎么写？** | 每个 program 负责「一条序列 × 一个 query 块 × 一个 head」；沿 KV 方向以 BLOCK_N 为步长循环，每次按页表查出 block id 与槽位、载入 K/V 块；online softmax（m_i / l_i / acc 三元组滚动更新）避免物化整个 scores。踩过的坑：① `tl.dot` 要求 K ≥ 16（我测试用的 head_dim=8 直接编译失败）；② BLOCK_M > n_q 时无效行被整行掩掉 → -inf → NaN，得把无效行的位置钳到最后一个有效位置 |
+| **⚠️ 为什么微基准加速比不随 seq_len 单调？** | 因为两个实现的瓶颈不同：PyTorch 版**启动受限**（耗时几乎不随 seq_len 变，0.36 → 0.50 ms），Triton 版**带宽受限**（要真去搬更多 KV），所以 seq_len 小时 Triton 赢在"少十几次启动"，seq_len 大时差距收窄。更根本的短板是我**没做 split-K**——单序列只有 H=12 个 program，128 个 SM 大量空转。真 vLLM 用 flash-decoding 把 KV 维也切开并行再规约 |
 | **「命中缓存」的严谨定义？** | token 序列的**精确公共前缀**（非语义相似）。依据是注意力的位置不变性 ⇒ 前缀的 K/V 可无损复用 |
 | **真 SGLang 和你的差距？** | **不分裂**（部分重叠直接放弃插入）、**无 refill**、**无驱逐**、**kernel 是 PyTorch**。完整清单见 `official-vs-mine.md` |
 
@@ -98,13 +105,17 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M4b Step 4 KV 显存 | 2.2 MB（批宽锁死 S=182 × 2 行，含填充）→ **1.2 MB**（峰值实际占用，完成即归还） | `benchmark/verify_m4b.py` |
 | M6 Chunked Prefill | 同负载：总前向 37 → **30**；补入独立前向 7 → **0**；prefill/decode 同批 7 步 | `benchmark/verify_m6.py` |
 | M6 单步成本上限 | `max_prefill_tokens` 不限 / 64 / 16 → 单步峰值 157 / 64 / **16** token（总前向 30 / 32 / 39） | `benchmark/verify_m6.py` |
-| ⚠️ 同一负载的墙钟 | M2.5 **306ms** → Step4 670ms → M6 624ms（重复 3 次取最短） | `benchmark/verify_m6.py` |
+| ⚠️ 同一负载的墙钟 | M2.5 **306ms** → Step4 670ms → M6 624ms → **M6+Triton 301ms**（重复 3 次取最短） | `benchmark/verify_m6.py` / `verify_m5.py` |
+| M5 Triton 端到端 | PyTorch 分页 **565 → 301 ms（1.88x）**；输出与调度统计完全一致 | `benchmark/verify_m5.py` |
+| M5 微基准（单层 decode） | seq_len 128–2048、block_size 8/16/32：1.0–2.0x，且**不随 seq_len 单调** | `benchmark/verify_m5.py` |
 
 > ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
-> ⚠️ **Step 4 / M6 的墙钟【反而比 M2.5 慢 2 倍】**（306ms → 624ms），而喂入 token 降了 6.6 倍。
-> 原因：① 逐序列注意力是 Python 循环（M2.5 用的是 HF 里融合好的批式注意力）；② 小模型地板效应。
-> **这条一定要主动讲** —— 它把"为什么 M5 的 Triton kernel 是必需的"变成了一个可量化的事实，
-> 而不是"我想学 Triton"。
+> ⚠️ **Step 4 / M6 的墙钟曾【比 M2.5 慢 2 倍】**（306ms → 624ms），而喂入 token 降了 6.6 倍。
+> 原因：① 逐序列注意力是 Python 循环（每层十来个 kernel + 一圈 Python）；② 小模型地板效应。
+> **M5 的 Triton kernel 把这段差距补上了（565 → 301 ms，1.88x）**，墙钟追平 M2.5 而 token 数低 6.6 倍。
+> 这条“先量出问题 → 再针对性写 kernel”的弧线，比直接说“我写了 Triton kernel”有说服力得多。
+> ⚠️ 同时要**主动交代尚未解决的部分**：我的 kernel 没有 split-K，单序列只有 H=12 个 program，
+> 微基准加速比只有 1.0–2.0x 且不随 seq_len 单调。知道自己的 kernel 瓶颈在哪，比报一个好看的数字更像工程师。
 
 **测试统计**（`pytest tests/ --collect-only`）：
 
@@ -116,11 +127,13 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M4b Step 3 分页增量解码 | 6 |
 | M4b Step 4 分页调度（零填充 varlen） | 12 |
 | M6 Chunked Prefill | 10 |
-| 合计 | **98（全部通过，无 xfail）** |
+| M5 Triton kernel（对齐参考实现） | 21 |
+| M5 Triton 端到端（换后端，输出与统计不变） | 10 |
+| 合计 | **129（全部通过，无 xfail）** |
 
 ## 5. 上简历前 Checklist
 
-- [x] `pytest tests/` 全绿（98 passed，无 xfail）
+- [x] `pytest tests/` 全绿（129 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）

@@ -29,8 +29,14 @@ def paged_continuous_generate(
     requests: list[Request],
     pool: PagedKVPool,
     max_batch_size: int = 4,
+    hook_cls=None,
 ) -> tuple[list[torch.LongTensor], SchedulerStats]:
     """分页版连续准入解码（准入策略同 M2.5，KV 管理换成页表 + varlen 前向）。
+
+    Args:
+        hook_cls: 注意力实现（默认纯 PyTorch 的 BatchedPagedAttentionHook）。
+            M5 可换成 `TritonPagedAttentionHook` —— 调度器不需要知道区别，
+            这就是“循环只认识可调用对象”的又一次兑现。
 
     与 `continuous_generate` 的关键差异：
       · 每条序列有自己的长度，**从不左填充** → `stats.padded_positions == 0`
@@ -50,6 +56,7 @@ def paged_continuous_generate(
     stats = SchedulerStats()
     if not requests:
         return [], stats
+    hook_cls = hook_cls or BatchedPagedAttentionHook
 
     B = min(max_batch_size, len(requests))
     device = requests[0].prompt.device
@@ -87,7 +94,7 @@ def paged_continuous_generate(
             pos.append(torch.arange(L, device=device))
             lens.append(L)
 
-        hook = BatchedPagedAttentionHook(
+        hook = hook_cls(
             pool, [tables[i] for i, _ in pairs], [0] * len(pairs), lens)
         logits = gpt2_forward(torch.cat(flat).unsqueeze(0), weights,
                               attention_fn=hook,
@@ -126,7 +133,7 @@ def paged_continuous_generate(
             ensure_blocks(pool, tables[i], length[i] + 1)
             feed.append(last[i])
             pos.append(length[i])                      # 绝对位置 = 池里已有的 token 数
-        hook = BatchedPagedAttentionHook(
+        hook = hook_cls(
             pool, [tables[i] for i in active], [length[i] for i in active],
             [1] * len(active))
         logits = gpt2_forward(torch.tensor([feed], device=device), weights,
@@ -156,6 +163,7 @@ def chunked_prefill_generate(
     pool: PagedKVPool,
     max_batch_size: int = 4,
     max_prefill_tokens: int = 512,
+    hook_cls=None,
 ) -> tuple[list[torch.LongTensor], SchedulerStats]:
     """M6：Chunked Prefill —— 把 prefill 塞进 decode 的同一次前向。
 
@@ -193,6 +201,7 @@ def chunked_prefill_generate(
     stats = SchedulerStats()
     if not requests:
         return [], stats
+    hook_cls = hook_cls or BatchedPagedAttentionHook
 
     B = min(max_batch_size, len(requests))
     device = requests[0].prompt.device
@@ -263,7 +272,7 @@ def chunked_prefill_generate(
         stats.mixed_steps += 1 if n_pre and n_pre < len(kinds) else 0
 
         # ── 一次前向同时服务 prefill 与 decode ──
-        hook = BatchedPagedAttentionHook(
+        hook = hook_cls(
             pool, [tables[i] for i in owners], bases, sizes)
         logits = gpt2_forward(torch.cat(flat).unsqueeze(0), weights,
                               attention_fn=hook,
