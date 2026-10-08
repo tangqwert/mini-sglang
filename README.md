@@ -1,15 +1,21 @@
 # mini-sglang
 
-**从零实现的轻量级 LLM 推理引擎** —— 参考 SGLang 架构，以 TDD 方式亲手构建推理系统的五层核心路径：解码循环 → KV Cache → Continuous Batching → Radix 前缀缓存 → 分页 KV / PagedAttention。
+**从零实现的轻量级 LLM 推理引擎** —— 参考 SGLang 架构，以 TDD 方式亲手构建推理系统的完整链路：
+
+```
+朴素解码 → KV Cache → Continuous Batching → Radix 前缀缓存 → 分页 KV / PagedAttention
+        → 零填充 varlen 调度 → Chunked Prefill → 自研 GPT-2 前向 → 自研 Triton 分页注意力 kernel
+```
 
 不是为了调用推理框架，而是为了回答一个问题：**vLLM/SGLang 到底在优化什么，为什么，以及优化在什么场景下不划算。**
+
+- 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B ｜ Python / PyTorch / Triton
+- **129 项测试全部通过**，每条优化路径都与朴素实现做**逐 token 一致性**验证
+- **7 组带数字的对照实验**（含 3 个诚实的负结果/反常现象）+ 1 个自研 Triton kernel（端到端 **1.88x**）
 
 > ⚠️ **与官方同名项目的区分**：本仓库是**教学向**实现，与 SGLang 官方的
 > [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级 benchmark）**无代码或血缘关系**。
 > 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
-
-- 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
-- 全程测试驱动：129 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
 
 ## 快速入门
 
@@ -87,6 +93,9 @@ decode throughput  : 163.5 tokens/s
 
 > 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
 > 由于两者的权重规模差 4x、地板效应本就主导，长度差异不影响结论方向；若要严格 apples-to-apples，需在相同长度下重跑。
+>
+> **数字出处**：M0/M1 的原始测量在 [`benchmark/results/`](benchmark/results/)（每次计时都入库，可直接核对）；
+> M2 之后的对照全部由 `benchmark/verify_m*.py` 现跑现测 —— 想验证就自己跑一遍。
 
 ## 核心洞察：七个"理论收益 ≠ 实测收益"的对照实验
 
@@ -203,3 +212,8 @@ sudo apt-get install -y build-essential python3-dev
 没装这些也能跑全量测试 —— `tests/test_triton_*.py` 会自动跳过（`importorskip` / 无 CUDA 时 `skipif`）。
 
 集成测试需要 GPU 与已下载的 `gpt2` 权重（自动缓存于 `~/.cache/huggingface`）。
+
+## 许可
+
+MIT —— 见 [`LICENSE`](LICENSE)。本项目是**个人学习/作品集项目**，不追求生产可用性；
+与 SGLang 官方及其任何衍生项目无关联。

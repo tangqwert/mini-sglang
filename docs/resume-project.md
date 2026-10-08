@@ -5,17 +5,47 @@
 
 ## 0. 一句话定位
 
-从零手写轻量级 LLM 推理引擎，覆盖 **解码循环 → KV Cache → Continuous Batching → Radix 前缀缓存**；
-TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实测数据反推各优化的**收益边界**。
+从零手写轻量级 LLM 推理引擎，覆盖 **解码循环 → KV Cache → Continuous Batching →
+Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill →
+自研 Triton kernel**；TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，
+并用实测数据反推各优化的**收益边界**（含 3 个诚实的负结果 / 反常现象）。
 
 ⚠️ **与官方同名项目的区分**：本仓库与 SGLang 官方的
 [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级）
 **无代码或血缘关系**，交集只有 Radix Cache 一个概念。模块级对照见 [`official-vs-mine.md`](./official-vs-mine.md)。
 
-## 1. 简历条目（投递版 · v1）
+## 1. 简历条目
 
-> **Mini-SGLang：从零实现轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch）
+### §1A 投递版（**只放这 5 条**）
+
+> ⚠️ 简历「项目经历」一栏放得下 4–5 条。下面 5 条是**精筛版**：每条一个能力信号，
+> 不重不漏。更细的 12 条在 §1B，**不上简历**，只做面试弹药。
+
+> **Mini-SGLang：从零实现轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch / Triton）
 > 2026.09 - 至今　github.com/tangqwert/mini-sglang
+
+- **从零实现推理引擎全链路**：朴素解码 → KV Cache → Continuous Batching（含槽位连续准入）
+  → Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill
+  → 自研 GPT-2 前向 → **自研 Triton kernel**；**129 项测试全绿**，每条优化路径都与朴素实现
+  做**逐 token 一致性**验证
+- **KV Cache 与跨模型瓶颈分析**：基于注意力位置不变性手写 prefill + 单 token 增量前向，
+  gpt2 696-token prompt 下 29.2 → 6.5 ms/token（**4.51x**）；跨模型对照实验发现收益被
+  「权重搬运地板效应」压缩（Qwen2.5-0.5B 仅 1.95x、短 prompt 反而 0.94x 微负），
+  归纳出「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
+- **分页 KV + 零填充 varlen 调度 + Chunked Prefill**：分页池 + 页表按需增长 + 完成即归还；
+  多请求 prompt 拍平成 varlen 一次前向（flash-attn 的 `cu_seqlens` 语义），左填充彻底消失
+  —— 同负载喂入 token **1463 → 222（6.6x）**、填充位置 1220 → **0**；再把 prefill 与 decode
+  合进同一步，总前向 37 → **30**、补入独立前向 7 → **0**
+- **自研 GPT-2 前向 + 自研 Triton 分页注意力 kernel**：脱离 `transformers` 从权重手写
+  完整前向（与 HF 逐元素一致，max|diff| ~5e-5，含手写 LayerNorm / 多头切分 / 因果掩码）；
+  再用 Triton 把「查页表 gather + 因果掩码 + online softmax + 加权求和」封进**一个** kernel
+  （分页版 flash attention），端到端 **565 → 301 ms（1.88x）**，输出与调度统计与 PyTorch
+  后端完全一致
+- **性能建模与诚实结论**：归纳「优化收益 = 被省成分的成本 − 新增机制的开销」，并**主动报告
+  3 个负结果/反常现象**及其成因与下一步：Radix 缓存 **0.82x**；分页调度墙钟一度**反而慢 2 倍**，
+  定位到 Python 循环的 kernel 启动开销后用自研 kernel 追平；剩余短板 split-K 已定位待补
+
+### §1B 面试弹药（**不上简历**，但每条都要能讲）
 
 - **KV Cache 增量解码**：基于注意力位置不变性手写 prefill + 单 token 增量前向，输出与朴素解码逐 token 一致；
   gpt2 696-token prompt 下 29.2 → 6.5 ms/token（**4.51x**）
@@ -94,9 +124,9 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 
 | 实验 | 数据 | 出处 |
 |---|---|---|
-| M1 KV cache（gpt2, **696** tok） | 3.739s → 0.828s；29.2 → 6.5 ms/token，**4.51x** | `m0_naive_long.json` / `m1_kv_long.json` |
-| M1 KV cache（Qwen2.5-0.5B, **601** tok） | 3.705s → 1.900s；28.9 → 14.8 ms/token，**1.95x** | `m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
-| M1 短 prompt（gpt2, **5** tok） | 0.738s → 0.783s；5.8 → 6.1 ms/token，**0.94x（微负）** | `m0_naive_short.json` / `m1_kv_short.json` |
+| M1 KV cache（gpt2, **696** tok） | 3.739s → 0.828s；29.2 → 6.5 ms/token，**4.51x** | `benchmark/results/m0_naive_long.json` / `m1_kv_long.json` |
+| M1 KV cache（Qwen2.5-0.5B, **601** tok） | 3.705s → 1.900s；28.9 → 14.8 ms/token，**1.95x** | `benchmark/results/m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
+| M1 短 prompt（gpt2, **5** tok） | 0.738s → 0.783s；5.8 → 6.1 ms/token，**0.94x（微负）** | `benchmark/results/m0_naive_short.json` / `m1_kv_short.json` |
 | M2 batching（4 请求） | 批 516ms vs 逐条 606ms，**1.18x** | `benchmark/verify_m2.py` |
 | M2.5 连续准入（4 请求 / 2 槽位） | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入）；理想 2.00x，实测 **1.25x** | `tests/test_batching.py::TestContinuous` |
 | M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出**逐 token 一致** | `benchmark/verify_m3.py` |
@@ -131,16 +161,28 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M5 Triton 端到端（换后端，输出与统计不变） | 10 |
 | 合计 | **129（全部通过，无 xfail）** |
 
-## 5. 上简历前 Checklist
+## 5. 投递前 Checklist
 
+### 代码 / 仓库
 - [x] `pytest tests/` 全绿（129 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）
 - [x] GitHub 定位声明（README 顶部，解决同名混淆）
-- [ ] GitHub About 栏补描述 + topics（`llm-inference` / `kv-cache` / `paged-attention` / `tutorial`）
-- [ ] （可选）完成 M4a → 追加 PagedAttention bullet（v2）
-- [ ] （投递期）性能建模修正版 → 追加建模 bullet（v3）
+- [x] `benchmark/results/*.json` **已入库** —— 之前被 `.gitignore` 漏掉，会让"数字可现场核对"变成空话
+- [x] `LICENSE`（MIT）已补
+- [ ] GitHub About 栏 + topics ← **见 §7，5 分钟**
+
+### 简历（投递前必做）
+- [ ] 项目经历栏换成 **§1A 的 5 条**（不要直接把 §1B 的 12 条堆上去）
+- [ ] 按 **§8** 清理现有简历的问题（Vibe Coding / 实习时长 / "熟悉结构" / `xxx` 占位 / 技能栏措辞）
+- [ ] 导出 PDF，检查：① 一页 ② 链接可点 ③ 无错别字
+- [ ] **用手机打开仓库链接**，确认 README 排版没崩（架构图、表格、嵌套代码块）
+
+### 投递节奏
+- [ ] 先投 3–5 家「不那么想去」的练手，24h 内复盘被问到什么
+- [ ] 再投目标公司（字节 / 阿里 / 百度 / NVIDIA 中国 / 国产 GPU 厂商）
+- [ ] Boss 直聊开场带数字：「做过从零实现的 LLM 推理引擎，含自研 PagedAttention Triton kernel；可立即到岗，实习 6 个月以上」
 
 ## 6. 数字纪律（写简历前的自检）
 
@@ -150,4 +192,41 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 4. **不留占位符**：`xxx` / `待定` 一律不能出现在投递版
 5. **不写 AI 辅助工具**：`Cursor` / `Codex` / "Vibe Coding" 对 AI Infra 岗位是减分项
 6. **必写**：GitHub 链接 + 可实习时长（**可立即到岗，实习期 6 个月以上** —— 这是你的稀缺优势）
+
+## 7. GitHub 展示（5 分钟，性价比最高的一步）
+
+仓库：https://github.com/tangqwert/mini-sglang
+
+**① About 栏**（仓库首页右上角齿轮 ⚙ → Description）：
+
+```
+从零实现 LLM 推理引擎：KV Cache / Continuous Batching / PagedAttention / Chunked Prefill / 自研 Triton kernel｜129 测试全绿
+```
+
+**② Topics**（同一面板，逐个填）：
+
+```
+llm-inference   kv-cache   paged-attention   continuous-batching
+chunked-prefill   triton   cuda   pytorch   from-scratch   inference-engine
+```
+
+**③ 固定到主页**：Profile → Customize your pins → 勾上 `mini-sglang`（让 HR 一眼看到）
+
+**④ Social preview**（可选）：Settings → Social preview 传一张 README 截图
+
+> ⚠️ **About 栏不要写**「熟悉 Transformer 原理」这类无信息量的话。
+> 写**你造了什么**（from-scratch inference engine）+ **最硬的证据**（自研 Triton kernel / 129 测试）。
+
+## 8. 你现有简历需要改的地方
+
+> 下面几条是在早前沟通里提到的点。把简历原文发我，我可以直接逐句改。
+
+| 位置 | 现在是 | 改成 | 为什么 |
+|---|---|---|---|
+| 技能/其他栏 | 「具有 Vibe Coding 基础，会使用 Codex 等 agent 协助助手」 | **整行删掉** | 对 AI Infra 是**减分项**：它暗示「代码不是你写的」。而你最强的资产恰恰是「从零手写、逐 token 一致性验证」 |
+| 实习时间 | 「可实习三个月以上」 | 「**可立即到岗，实习期 6 个月以上**（2026.09–2027.07）」 | 你是 gap year，能连续实习 6–11 个月 —— 相对在校生这是**最大稀缺优势**，必须明确写出来 |
+| 项目描述 | 「熟悉 mini-sglang 的整体结构」 | 「**从零实现** mini-sglang：…」（用 §1A 的 5 条） | 「熟悉结构」读起来像在读别人的仓库；这个项目是**你自己写的** |
+| 占位符 | 文中的 `xxx` | 填掉或整条删掉 | 投递版留占位符 = 不认真（§6 第 4 条） |
+| 技能栏（若写了 CUDA） | 「熟悉 CUDA」 | 「CUDA：掌握并行编程模型与 profiling；正在做算子练习」 | 诚实且不露怯；被追问 coalescing / tiling 细节时不会翻车（§6 第 3 条） |
+| 技能栏 | 「熟悉 Triton」（若只列在技能栏） | 「Triton：手写过分页注意力 kernel（online softmax + 页表访存）」 | 写在**项目**栏里、且在技能栏标出具体做到什么程度，比单写一个词可信得多 |
 

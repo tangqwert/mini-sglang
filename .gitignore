@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-benchmark/results/*.json
+# 注意：benchmark/results/*.json 【要入库】—— 它是 README 里每个数字的出处，
+# 不提交的话"数字可验证"就成了一句空话（这些文件仅 ~150 字节）
 # 模型权重绝不进库（默认在 ~/.cache/huggingface，双保险）
 *.safetensors
 *.bin
