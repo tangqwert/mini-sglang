@@ -230,6 +230,11 @@ class BatchedPagedAttentionHook:
         self.base = list(bases)
         self.new_lens = list(new_lens)
         self.n_seq = len(self.new_lens)
+        # 三个列表必须按【同一个序列顺序】一一对应 —— 少一个就会把 A 的起点
+        # 配到 B 的页表上（写入位置静默错位，结果全错）。
+        assert len(self.block_tables) == self.n_seq == len(self.base), (
+            f"参数不对齐：block_tables={len(self.block_tables)}, "
+            f"bases={len(self.base)}, new_lens={self.n_seq}")
         self.written = [b + n for b, n in zip(self.base, self.new_lens)]
         # 每条序列在拍平维度上的起点（cu_seqlens）
         self.cu = [0]

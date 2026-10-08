@@ -127,7 +127,8 @@ def paged_continuous_generate(
             feed.append(last[i])
             pos.append(length[i])                      # 绝对位置 = 池里已有的 token 数
         hook = BatchedPagedAttentionHook(
-            pool, [tables[i] for i in active], list(length), [1] * len(active))
+            pool, [tables[i] for i in active], [length[i] for i in active],
+            [1] * len(active))
         logits = gpt2_forward(torch.tensor([feed], device=device), weights,
                               attention_fn=hook,
                               position_ids=torch.tensor([pos], device=device))
@@ -138,6 +139,152 @@ def paged_continuous_generate(
 
         stats.steps += 1
         stats.idle_slot_steps += B - len(active)
+
+    outs = []
+    for r in requests:
+        gen = torch.tensor([generated[r.req_id]], dtype=torch.long,
+                           device=r.prompt.device)
+        outs.append(torch.cat([r.prompt.reshape(1, -1), gen], dim=1))
+    return outs, stats
+
+
+# ─────────────────── M6：Chunked Prefill（prefill 与 decode 合流）───────────────────
+
+def chunked_prefill_generate(
+    weights: GPT2Weights,
+    requests: list[Request],
+    pool: PagedKVPool,
+    max_batch_size: int = 4,
+    max_prefill_tokens: int = 512,
+) -> tuple[list[torch.LongTensor], SchedulerStats]:
+    """M6：Chunked Prefill —— 把 prefill 塞进 decode 的同一次前向。
+
+    ── 要解决的最后一个痛点 ──
+    M4b Step 4 把"补入时的填充计算"去掉了（喂入 token 降为 1/6.6），但**前向次数
+    一个没少**：补入一条新请求仍然要单独跑一次 prefill 前向。所以 1.25x（理想 2.00x）
+    只修好了一半。M6 修另一半。
+
+    ── 怎么做 ──
+    varlen 批次本来就不要求各序列长度相同！于是同一次前向里可以混着：
+        活跃序列各贡献 1 个 token（decode）
+        + 刚补入的序列贡献它的前 L 个 token（prefill）
+    对 `BatchedPagedAttentionHook` 来说这只是 `new_lens = [1, 1, L]` 而已 —— 钩子
+    不用改，改的是调度器怎么组这个批。真引擎（vLLM/SGLang）做的就是这件事，
+    它们的术语叫 **mixed batch / prefill-decode 合流**。
+
+    ── 为什么还要"chunked" ──
+    如果一条 4096-token 的 prompt 独占一步，这一步的算力就是别人的 4096 倍，
+    其他请求的 ITL（inter-token latency，逐 token 延迟）会被这一个"巨无霸步"打爆。
+    所以把 prompt 切成若干块、每步只喂 `max_prefill_tokens` 个（vLLM 里叫
+    `max_num_batched_tokens`），把单步成本摊平 —— 这就是 Chunked Prefill 的名字来源。
+    分块的正确性依赖两点：① 位置编号必须是**绝对位置**（跨块连续）；
+    ② 后续块的 query 必须能看到前面块 —— 前面块已在池里，gather 得到，天然满足。
+
+    ── 关键不变量 ──
+    · `stats.admission_forwards == 0` —— 不存在"专门为补入开的独立前向"
+    · `stats.mixed_steps > 0` —— 确实发生了 prefill/decode 同批（M2.5/Step4 恒为 0）
+    · `stats.padded_positions == 0` —— 仍然是零填充
+
+    契约（其余同 `paged_continuous_generate`）：
+      · 输出逐 token == 每条请求单独跑朴素解码（顺序同 requests）。
+      · 每条请求的 EOS / 预算独立生效；不修改 requests 的 prompt。
+    """
+    assert max_prefill_tokens >= 1, "max_prefill_tokens 至少要能喂 1 个 token，否则无法推进"
+    stats = SchedulerStats()
+    if not requests:
+        return [], stats
+
+    B = min(max_batch_size, len(requests))
+    device = requests[0].prompt.device
+
+    pending = list(requests)
+    slot: list[Request | None] = [None] * B
+    tables: list[list | None] = [None] * B
+    length = [0] * B                 # 已写入池的 token 数
+    phase = ["free"] * B             # 'free' | 'prefill' | 'decode'
+    last = [0] * B                   # decode 阶段待喂的 token（绝对位置 = length）
+    generated: dict[int, list[int]] = {}
+    remaining = [0] * B
+
+    def register(i: int, tok: int) -> None:
+        """登记第 i 行刚产出的 token；完成则释放槽位并归还分页显存。"""
+        r = slot[i]
+        generated[r.req_id].append(tok)
+        remaining[i] -= 1
+        if remaining[i] <= 0 or (r.eos_token_id is not None and tok == r.eos_token_id):
+            for b in tables[i]:
+                pool.free(b)
+            slot[i], tables[i], phase[i] = None, None, "free"
+
+    while True:
+        # ── 组混合批：活跃槽位各 1 token 的 decode + 空槽位补入并喂一块 prefill ──
+        flat, pos, bases, sizes, owners, kinds = [], [], [], [], [], []
+        budget = max_prefill_tokens
+
+        for i in range(B):
+            if slot[i] is None:
+                if not pending or budget <= 0:
+                    continue
+                r = pending.pop(0)
+                slot[i], tables[i], length[i], phase[i] = r, [], 0, "prefill"
+                generated[r.req_id] = []
+                remaining[i] = r.max_new_tokens
+                stats.admissions += 1
+
+            if phase[i] == "prefill":
+                L = slot[i].prompt.numel()
+                take = min(L - length[i], budget)      # 本步这块的大小
+                if take <= 0:
+                    continue                           # 预算被前面的槽位用完了，下一步再来
+                ensure_blocks(pool, tables[i], length[i] + take)
+                flat.append(slot[i].prompt.reshape(-1)[length[i]:length[i] + take])
+                # ★ 绝对位置：跨块必须连续（第 2 块要从 take 开始，而不是从 0）
+                pos.append(torch.arange(length[i], length[i] + take, device=device))
+                bases.append(length[i])
+                sizes.append(take)
+                budget -= take
+                stats.prefill_tokens += take
+                stats.prefill_chunks += 1
+            else:                                      # decode：1 个 token
+                ensure_blocks(pool, tables[i], length[i] + 1)
+                flat.append(torch.tensor([last[i]], device=device))
+                pos.append(torch.tensor([length[i]], device=device))
+                bases.append(length[i])
+                sizes.append(1)
+
+            owners.append(i)
+            kinds.append(phase[i])
+
+        if not owners:
+            break                                      # 没活跃、也没得补 → 收工
+
+        n_pre = kinds.count("prefill")
+        stats.prefill_steps += 1 if n_pre else 0
+        stats.mixed_steps += 1 if n_pre and n_pre < len(kinds) else 0
+
+        # ── 一次前向同时服务 prefill 与 decode ──
+        hook = BatchedPagedAttentionHook(
+            pool, [tables[i] for i in owners], bases, sizes)
+        logits = gpt2_forward(torch.cat(flat).unsqueeze(0), weights,
+                              attention_fn=hook,
+                              position_ids=torch.cat(pos).unsqueeze(0))
+
+        ends = torch.tensor(sizes).cumsum(0) - 1       # 各序列在拍平维度的末位
+        for j, i in enumerate(owners):
+            length[i] += sizes[j]                      # 本步的 K/V 已进池
+            if kinds[j] == "prefill":
+                if length[i] == slot[i].prompt.numel():
+                    # 最后一块喂完 → 本步末位 logits 就是第一个生成 token，转入 decode
+                    phase[i] = "decode"
+                    last[i] = int(logits[0, ends[j]].argmax())
+                    register(i, last[i])
+                # 还没喂完的块：不产出 token，继续 prefill
+            else:
+                last[i] = int(logits[0, ends[j]].argmax())
+                register(i, last[i])
+
+        stats.steps += 1
+        stats.idle_slot_steps += B - len(owners)
 
     outs = []
     for r in requests:

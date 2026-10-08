@@ -223,12 +223,22 @@ class SchedulerStats:
         admission_forwards: 补入附带的独立 prefill 前向次数。
         idle_slot_steps:    Σ 每步空闲槽位数 —— 批利用率的损失。
         padded_positions:   Σ 左填充产生的位置数 —— 显存碎片。
+        prefill_steps:      （M6）含 prefill 工作的步数。
+        mixed_steps:        （M6）同一步里【既有 prefill 又有 decode】的步数
+                            —— 这是"prefill 与 decode 合并"的直接证据。
+                            M2.5/Step4 恒为 0（两者各开各的前向）。
+        prefill_chunks:     （M6）prefill 被切成的段数；> admissions 即发生过跨步分块。
+        prefill_tokens:     （M6）prefill 处理掉的 token 总数（可用来对照填充浪费）。
     """
     steps: int = 0
     admissions: int = 0
     admission_forwards: int = 0
     idle_slot_steps: int = 0
     padded_positions: int = 0
+    prefill_steps: int = 0
+    mixed_steps: int = 0
+    prefill_chunks: int = 0
+    prefill_tokens: int = 0
 
 
 def continuous_generate(

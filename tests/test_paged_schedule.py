@@ -19,7 +19,8 @@ from engine.batching import Request
 from engine.model_forward import gpt2_forward, load_gpt2_weights
 from engine.naive_decode import DecodingConfig, autoregressive_generate
 from engine.paged_kv import PagedKVPool
-from engine.paged_schedule import paged_continuous_generate
+from engine.paged_schedule import (chunked_prefill_generate,
+                                   paged_continuous_generate)
 
 POOL_BLOCKS = 256
 
@@ -105,6 +106,26 @@ class TestPagedContinuous:
         assert stats.admission_forwards == 1, "两条补入合并成一次前向"
         assert len(pool.free_blocks) == POOL_BLOCKS, "收工后分页显存应全部归还"
 
+    def test_survives_slot_zero_finishing_first(self, gpt2, weights):
+        """★ 回归：槽位 0 先完成、只剩槽位 1 活跃时，bases 必须按【活跃子集】对齐。
+
+        Step 4 早期版本把整张 `length` 表传给了只含活跃槽位的钩子 —— 于是
+        "A 的起点" 配上了 "B 的页表"，写入位置静默错位。它与开头那两条
+        契约测试（active 恰好含槽位 0）擦肩而过：**盲区还是在"顺序/边界"**，
+        M1 的 EOS 边界、M3 的 full-hit 都是同一类。已在钩子里加长度一致性断言。
+        """
+        model, tok = gpt2
+        reqs = [Request(req_id=0, prompt=tok("Hi", return_tensors="pt").input_ids,
+                        max_new_tokens=1),                  # 首步即完成 → 槽位 0 空出
+                Request(req_id=1, prompt=tok("Hello world, this is a test",
+                                             return_tensors="pt").input_ids,
+                        max_new_tokens=4)]                  # 之后独自活跃于槽位 1
+        outs, _ = paged_continuous_generate(weights, reqs, make_pool(model.config),
+                                           max_batch_size=2)
+        for r, got in zip(reqs, outs):
+            assert torch.equal(got, naive(r.prompt, weights, r.max_new_tokens)), \
+                (got.tolist(), naive(r.prompt, weights, r.max_new_tokens).tolist())
+
     def test_admissions_are_batched_into_one_forward(self, gpt2, weights):
         """④ 4 条同预算请求、B=2：两条补入合并进【一次】前向（M2.5 是每条一次）。
 
@@ -159,9 +180,112 @@ class TestPagedContinuous:
         before = [r.prompt.clone() for r in reqs]
 
         outs, _ = paged_continuous_generate(weights, reqs, make_pool(model.config),
-                                           max_batch_size=2)
+                                            max_batch_size=2)
 
         for r, b in zip(reqs, before):
             assert torch.equal(r.prompt, b)
         for r, got in zip(reqs, outs):          # 输出必须以【原始】 prompt 开头
             assert torch.equal(got[0, : r.prompt.shape[1]], r.prompt[0])
+
+
+LONG_TEXT = ("In a world where artificial intelligence shapes everything, "
+             "the race between capability and responsibility defines our era. ")
+
+
+class TestChunkedPrefill:
+    """M6：Chunked Prefill —— prefill 与 decode 合进同一次前向。
+
+    与 Step 4 的差别只在调度器怎么组批：varlen 批次里同时放
+    “活跃序列各 1 个 token” 与 “新序列的一大块 prompt”。
+    """
+
+    def _reqs(self, tok, texts, budgets):
+        return [Request(req_id=i, prompt=tok(t, return_tensors="pt").input_ids,
+                        max_new_tokens=b)
+                for i, (t, b) in enumerate(zip(texts, budgets))]
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 512])
+    def test_matches_naive_across_chunk_sizes(self, gpt2, weights, chunk):
+        """★ 核心契约：分块大小任意（含 1）都应逐 token 等于朴素解码。
+
+        分块的正确性靠两点：绝对位置跨块连续 + 后续块能看到前面块。
+        把 chunk 设成 1 是最狠的压力测试（每个 token 单独一步去喂）。
+        """
+        model, tok = gpt2
+        reqs = self._reqs(tok, ["Hello world", "Hi", "The meaning of life"],
+                          [2, 3, 2])
+
+        outs, _ = chunked_prefill_generate(weights, reqs, make_pool(model.config),
+                                          max_batch_size=2, max_prefill_tokens=chunk)
+        for r, got in zip(reqs, outs):
+            assert torch.equal(got, naive(r.prompt, weights, r.max_new_tokens)), \
+                f"chunk={chunk} 请求 {r.req_id}: {got.tolist()}"
+
+    def test_no_dedicated_admission_forward(self, gpt2, weights):
+        """★ M6 的核心收益：补入不再需要独立前向，且确实与 decode 同批。"""
+        model, tok = gpt2
+        reqs = self._reqs(tok, ["Hi", "Hello world, this is a test",
+                                "Hi", "The meaning of life is"],
+                          [1, 3, 1, 3])
+
+        outs, stats = chunked_prefill_generate(weights, reqs, make_pool(model.config),
+                                              max_batch_size=2)
+
+        assert stats.admission_forwards == 0, "M6 不该有专门为补入开的前向"
+        assert stats.admissions > 0, "本负载应确实发生补入"
+        assert stats.mixed_steps > 0, "应至少有一步同时含 prefill 与 decode"
+        assert stats.padded_positions == 0
+        for r, got in zip(reqs, outs):
+            assert torch.equal(got, naive(r.prompt, weights, r.max_new_tokens))
+
+    def test_long_prompt_is_split_into_chunks(self, gpt2, weights):
+        """分块生效：长 prompt 被切成多块，而非一步吃下。"""
+        model, tok = gpt2
+        reqs = self._reqs(tok, [LONG_TEXT, "Hi"], [2, 2])
+        L = reqs[0].prompt.numel()
+        chunk = 8
+
+        outs, stats = chunked_prefill_generate(weights, reqs, make_pool(model.config),
+                                              max_batch_size=2, max_prefill_tokens=chunk)
+
+        assert L > chunk, f"测试前提：prompt 要长于一块（L={L}）"
+        assert stats.prefill_tokens == L + reqs[1].prompt.numel(), \
+            "prefill 处理的 token 总数应恰等于两个 prompt 之和（没有多余计算）"
+        assert stats.prefill_chunks > stats.admissions, \
+            f"分块数 {stats.prefill_chunks} 应多于补入次数 {stats.admissions}"
+        for r, got in zip(reqs, outs):
+            assert torch.equal(got, naive(r.prompt, weights, r.max_new_tokens))
+
+    def test_single_chunk_matches_step4_exactly(self, gpt2, weights):
+        """不分块（chunk 足够大）时，M6 应与 Step 4 逐 token 一致。"""
+        model, tok = gpt2
+        reqs = self._reqs(tok, [LONG_TEXT, "Hi", "The meaning of life"], [3, 2, 4])
+        pool_a, pool_b = make_pool(model.config), make_pool(model.config)
+
+        out_a, _ = paged_continuous_generate(weights, reqs, pool_a, max_batch_size=2)
+        out_b, stats = chunked_prefill_generate(weights, reqs, pool_b,
+                                               max_batch_size=2,
+                                               max_prefill_tokens=10 ** 6)
+
+        for a, b in zip(out_a, out_b):
+            assert torch.equal(a, b)
+        assert stats.mixed_steps > 0, "即使不分块，补入也应与 decode 合流"
+
+    def test_memory_returned_and_prompts_untouched(self, gpt2, weights):
+        model, tok = gpt2
+        reqs = self._reqs(tok, [LONG_TEXT, "Hi", "Hello world"], [3, 2, 2])
+        pool = make_pool(model.config)
+        before = [r.prompt.clone() for r in reqs]
+
+        _, stats = chunked_prefill_generate(weights, reqs, pool, max_batch_size=2,
+                                            max_prefill_tokens=16)
+
+        assert len(pool.free_blocks) == POOL_BLOCKS, "收工后分页显存应全部归还"
+        assert stats.padded_positions == 0
+        for r, b in zip(reqs, before):
+            assert torch.equal(r.prompt, b)
+
+    def test_empty_requests(self, gpt2, weights):
+        model, _ = gpt2
+        outs, stats = chunked_prefill_generate(weights, [], make_pool(model.config))
+        assert outs == [] and stats.steps == 0

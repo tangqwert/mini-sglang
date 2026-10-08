@@ -41,7 +41,12 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
   完成即归还显存；多请求 prompt 拍平成 **varlen** 一次前向（对应 flash-attn 的
   `cu_seqlens` 语义），左填充彻底消失。同负载下喂入 token 数 **1463 → 222（6.6x）**、
   填充位置 1220 → **0**，输出仍与朴素解码逐 token 一致
-- **测试驱动开发**：**87 项测试全部通过**（56 项假模型单元 + 31 项真模型），
+- **Chunked Prefill（M6）**：把 prefill 与 decode 合进**同一次** varlen 前向 ——
+  varlen 批次本来就不要求各序列等长，于是一个批里可以“活跃序列各 1 个 token（decode）
+  + 新序列一大块 prompt（prefill）”。总前向次数 37 → **30**、补入独立前向 7 → **0**、
+  prefill/decode 同批 7 步；再用 `max_prefill_tokens`（对应 vLLM 的
+  `max_num_batched_tokens`）给单步成本设上限（单步 token 峰值 157 → 16），把 ITL 摊平
+- **测试驱动开发**：**98 项测试全部通过**（56 项假模型单元 + 42 项真模型），
   每项优化均与朴素实现做逐 token 一致性验证，并用「喂入 token 数」精确账本断言开销
 
 ## 2. Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
@@ -55,7 +60,9 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | **为什么短 prompt 反而变慢？** | 5-token prompt 时 0.94x。KV Cache 省下的序列计算 < 新增机制开销（cache 更新 + Python 循环 + 额外的前向调用）。**优化的收益 = 被省成分的成本 − 新增机制的开销**，这是我在三个里程碑里反复验证的结论 |
 | **为什么需要 attention_mask / position_ids？** | 左填充的 pad 若不被 mask 会污染注意力；pad 占位又打乱了位置编号。两者都是**踩过真 RuntimeError 后**才补上的 |
 | **连续准入怎么实现的？为什么要"拷 cache 行"？** | HF 的批 cache 要求**所有行等长**，所以一条长度不同的新请求没法直接插进去。技巧是：把它左填充到当前批长 → 单独 prefill 一次拿到它自己的 K/V → 再把那一行拷进空槽。因果注意力逐行独立 ⇒ 与"它一开始就在批里"数值等价（实测 logits 差 < 4e-5） |
-| **那为什么收益只有 1.25x（理想 2.00x）？** | 补入需要**一次独立前向**（没有分页就没法和 decode 合并进同一 kernel），还留下左填充碎片。**这就是 PagedAttention 存在的理由** —— 分页后每行页表独立，既不用填充，补入也能并进同一个 kernel |
+| **那为什么收益只有 1.25x（理想 2.00x）？** | 两笔代价：① 补入要算 S 个填充位置（S ≈ 当前批长）；② 补入要多开**一次独立前向**。**分两步修完**：M4b 用分页 + varlen 消掉①（喂入 token 1463 → 222），M6 把 prefill 与 decode 合流消掉②（总前向 37 → 30，补入独立前向 7 → **0**）。**能把这个坑拆成两半分别验证，比报一个加速比更有说服力** |
+| **Chunked Prefill 是什么？为什么要 chunk？** | 把 prompt 切块、与 decode 合进同一步。不 chunk 的话一条 4096-token prompt 独占一步，这一步算力是别人的 4096 倍 → 其他请求的 ITL 被打爆。用 `max_prefill_tokens` 设上限后单步峰值 **157 → 16 token**，代价是前向次数变多（总计算量不变）。分块的正确性靠两点：**绝对位置跨块连续** + 后续块能看到前面块（已在池里，gather 天然满足）；我用 **chunk=1** 做了最狠的压力测试 |
+| **⚠️ 那分页路径墙钟反而更慢？** | 喂入 token 降 6.6 倍，墙钟 **306 → 624ms**。因为逐序列注意力是 Python 循环（每序列 × 每 query 位置一次调用），而 M2.5 用的是 HF 融合好的批式注意力。**这正是 M5 的动机**：把三层循环翻译成 Triton kernel，才把算力优势兼现成墙钟优势 |
 | **「命中缓存」的严谨定义？** | token 序列的**精确公共前缀**（非语义相似）。依据是注意力的位置不变性 ⇒ 前缀的 K/V 可无损复用 |
 | **真 SGLang 和你的差距？** | **不分裂**（部分重叠直接放弃插入）、**无 refill**、**无驱逐**、**kernel 是 PyTorch**。完整清单见 `official-vs-mine.md` |
 
@@ -87,12 +94,17 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M2.5 连续准入（4 请求 / 2 槽位） | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入）；理想 2.00x，实测 **1.25x** | `tests/test_batching.py::TestContinuous` |
 | M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出**逐 token 一致** | `benchmark/verify_m3.py` |
 | M3 radix 耗时 | **0.82x** —— 小模型 prefill ≈5ms 被权重搬运主导，省下的计算 < clone + Python 开销 | `benchmark/verify_m3.py` |
-| M4b Step 4 分页调度 | 1 长请求(153 tok) + 8 短请求｜槽位 2：喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；前向次数 **37 → 37（不变）**；墙钟 818 → 650ms（1.26x） | `benchmark/verify_m4b.py` |
+| M4b Step 4 分页调度 | 1 长请求(153 tok) + 8 短请求｜槽位 2：喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；前向次数 **37 → 37（不变）** | `benchmark/verify_m4b.py` |
 | M4b Step 4 KV 显存 | 2.2 MB（批宽锁死 S=182 × 2 行，含填充）→ **1.2 MB**（峰值实际占用，完成即归还） | `benchmark/verify_m4b.py` |
+| M6 Chunked Prefill | 同负载：总前向 37 → **30**；补入独立前向 7 → **0**；prefill/decode 同批 7 步 | `benchmark/verify_m6.py` |
+| M6 单步成本上限 | `max_prefill_tokens` 不限 / 64 / 16 → 单步峰值 157 / 64 / **16** token（总前向 30 / 32 / 39） | `benchmark/verify_m6.py` |
+| ⚠️ 同一负载的墙钟 | M2.5 **306ms** → Step4 670ms → M6 624ms（重复 3 次取最短） | `benchmark/verify_m6.py` |
 
 > ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
-> ⚠️ Step 4 的墙钟只快 1.26x 而 token 数降了 6.6x —— 因为 ① 前向次数没变（补入仍需独立前向）、
-> ② 逐序列注意力是 Python 循环（真引擎用 varlen kernel）、③ 小模型地板效应。**主动讲这条，比只报 6.6x 更可信。**
+> ⚠️ **Step 4 / M6 的墙钟【反而比 M2.5 慢 2 倍】**（306ms → 624ms），而喂入 token 降了 6.6 倍。
+> 原因：① 逐序列注意力是 Python 循环（M2.5 用的是 HF 里融合好的批式注意力）；② 小模型地板效应。
+> **这条一定要主动讲** —— 它把"为什么 M5 的 Triton kernel 是必需的"变成了一个可量化的事实，
+> 而不是"我想学 Triton"。
 
 **测试统计**（`pytest tests/ --collect-only`）：
 
@@ -102,12 +114,13 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M4a 分页 KV + PagedAttention | 19 |
 | M4b Step 1/2 自研前向 + 分页接入 | 12 |
 | M4b Step 3 分页增量解码 | 6 |
-| M4b Step 4 分页调度（零填充 varlen） | 11 |
-| 合计 | **87（全部通过，无 xfail）** |
+| M4b Step 4 分页调度（零填充 varlen） | 12 |
+| M6 Chunked Prefill | 10 |
+| 合计 | **98（全部通过，无 xfail）** |
 
 ## 5. 上简历前 Checklist
 
-- [x] `pytest tests/` 全绿（87 passed，无 xfail）
+- [x] `pytest tests/` 全绿（98 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）

@@ -51,24 +51,30 @@ class Counter:
         return f"forwards={self.forwards}, tokens_fed={self.tokens}"
 
 
-def run_m25(model, reqs):
-    """M2.5：整块 DynamicCache + 左填充。"""
+def run_m25(model, reqs, repeat=3):
+    """M2.5：整块 DynamicCache + 左填充（墙钟重复取最短，计量只做第一遍）。"""
     cnt = Counter()
     kv_forward = build_kv_forward(model, 'cuda')
+    state = {'count': True}
 
     def counting(ids, cache, attention_mask=None, position_ids=None):
-        cnt.forwards += 1
-        cnt.tokens += ids.shape[0] * ids.shape[1]
+        if state['count']:
+            cnt.forwards += 1
+            cnt.tokens += ids.shape[0] * ids.shape[1]
         return kv_forward(ids, cache, attention_mask, position_ids)
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    outs, stats = continuous_generate(counting, reqs, max_batch_size=BATCH)
-    torch.cuda.synchronize()
-    return outs, stats, cnt, time.perf_counter() - t0
+    times, outs, stats = [], None, None
+    for k in range(repeat):
+        state['count'] = (k == 0)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outs, stats = continuous_generate(counting, reqs, max_batch_size=BATCH)
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+    return outs, stats, cnt, min(times)
 
 
-def run_paged(weights, reqs, model):
+def run_paged(weights, reqs, model, repeat=3):
     """Step 4：分页池 + varlen 前向（零填充）。"""
     cfg = model.config
     pool = PagedKVPool(num_blocks=512, block_size=16,
@@ -76,13 +82,15 @@ def run_paged(weights, reqs, model):
                        head_dim=cfg.n_embd // cfg.n_head, device='cuda')
     cnt = Counter()
     peak = [0]
+    state = {'count': True}
 
     orig_forward = paged_schedule.gpt2_forward
     orig_alloc = pool.allocate
 
     def counting_forward(input_ids, w, position_ids=None, attention_fn=None):
-        cnt.forwards += 1
-        cnt.tokens += input_ids.shape[0] * input_ids.shape[1]
+        if state['count']:
+            cnt.forwards += 1
+            cnt.tokens += input_ids.shape[0] * input_ids.shape[1]
         return orig_forward(input_ids, w, position_ids=position_ids,
                             attention_fn=attention_fn)
 
@@ -93,18 +101,21 @@ def run_paged(weights, reqs, model):
 
     paged_schedule.gpt2_forward = counting_forward
     pool.allocate = counting_alloc
+    times, outs, stats = [], None, None
     try:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        outs, stats = paged_continuous_generate(weights, reqs, pool,
-                                                max_batch_size=BATCH)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
+        for k in range(repeat):
+            state['count'] = (k == 0)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            outs, stats = paged_continuous_generate(weights, reqs, pool,
+                                                    max_batch_size=BATCH)
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
     finally:
         paged_schedule.gpt2_forward = orig_forward
         pool.allocate = orig_alloc
     tokens_in_pool = peak[0] * pool.block_size
-    return outs, stats, cnt, elapsed, tokens_in_pool, pool
+    return outs, stats, cnt, min(times), tokens_in_pool, pool
 
 
 def main():

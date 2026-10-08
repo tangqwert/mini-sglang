@@ -9,7 +9,7 @@
 > 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
-- 全程测试驱动：87 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
+- 全程测试驱动：98 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
 
 ## 快速入门
 
@@ -29,6 +29,7 @@ python -m benchmark.bench --engine kv    --model gpt2 --max-new-tokens 128
 python -m benchmark.verify_m2
 python -m benchmark.verify_m3
 python -m benchmark.verify_m4b   # 分页调度 vs M2.5 连续准入（量化"填充浪费"）
+python -m benchmark.verify_m6    # 三方对照：M2.5 / 分页 / Chunked Prefill
 ```
 
 预期输出（KV Cache 路径）：
@@ -45,9 +46,9 @@ decode throughput  : 163.5 tokens/s
 ```
 ┌──────────────────────────────────────────────┐
 │ benchmark/  bench.py(--engine naive|kv)      │  测量与验证
-│             verify_m2/m3/m4b.py              │
+│             verify_m2/m3/m4b/m6.py           │
 ├──────────────────────────────────────────────┤
-│ engine/paged_schedule.py  分页调度（零填充） │  页表 + varlen（M4b）
+│ engine/paged_schedule.py  分页/合流调度      │  页表 + varlen（M4b/M6）
 │ engine/model_forward.py   自研 GPT-2 前向    │  接管 attention（M4b）
 │ engine/paged_kv.py       分页 KV 池 + 注意力 │  按页表 gather（M4a）
 │ engine/radix_cache.py     Radix 树前缀缓存   │  跨请求复用 KV
@@ -72,14 +73,16 @@ decode throughput  : 163.5 tokens/s
 | **Batching** | 4 请求批解码 vs 逐条 | 516 vs 606 ms（**1.18x**） | 收益 ∝ 请求数 × 权重搬运占比 |
 | **连续准入** | 4 请求（预算 1/5/1/5）｜槽位 2 | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入） | 理想 2.00x，实测 **1.25x** —— 差距即"补入需独立前向"的代价 |
 | **Radix 前缀缓存** | 3 请求共享 118-token 前缀 | **0.82x**（输出逐 token 一致） | 小模型 prefill 被权重搬运主导 |
-| **分页调度** | 1 长请求(153 tok) + 8 短请求｜槽位 2 | 喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；墙钟 818 → 650 ms | 前向**次数**不变（37），省的是每次前向里的填充计算 |
+| **分页调度（Step 4）** | 1 长请求(153 tok) + 8 短请求｜槽位 2 | 喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；前向次数 37 → 37（不变） | 分页只消掉了"填充计算" |
+| **Chunked Prefill（M6）** | 同上 | 总前向 37 → **30**；补入独立前向 7 → **0**；prefill/decode 同批 **7 步** | prefill 与 decode 合流，额外前向消失 |
+| ⚠️ 同一负载的墙钟 | 同上 | M2.5 **306ms** → Step4 670ms → M6 624ms | 分页路径**反而更慢**：逐序列注意力是 Python 循环（M5 的动机） |
 
 > 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
 > 由于两者的权重规模差 4x、地板效应本就主导，长度差异不影响结论方向；若要严格 apples-to-apples，需在相同长度下重跑。
 
-## 核心洞察：五个"理论收益 ≠ 实测收益"的对照实验
+## 核心洞察：六个"理论收益 ≠ 实测收益"的对照实验
 
-每个里程碑都做了理论推导与实测的对照，四次实验共同指向同一条成本模型：
+每个里程碑都做了理论推导与实测的对照，六次实验共同指向同一条成本模型：
 
 ```
 每步耗时 = 权重搬运（固定，∝模型大小） + 序列计算（∝上下文长度）
@@ -90,32 +93,45 @@ decode throughput  : 163.5 tokens/s
 - **连续准入** 省的是"已完成请求占着槽位空转"——但没有 PagedAttention 时，补入一条新请求需要
   一次**独立的前向**，把理想收益从 2.00x 压到 1.25x
 - **Radix Cache** 省的是"跨请求重复的 prefill 计算"——小模型 prefill 本身 ≈5ms，被 clone 与 Python 开销反超（0.82x）；真实收益场景是大模型 × 长前缀 × 高命中率（SGLang 用 PagedAttention 的零拷贝页引用消除 clone 开销）
-- **分页调度（M4b Step 4）** 省的是"补入新请求时的填充计算"——左填充彻底消失，喂入 token 数降为 **1/6.6**；
-  但**前向次数一个不少**（37 → 37），且墙钟只快 1.26x（Python 逐序列注意力开销 + 小模型地板效应）
+- **分页调度（M4b Step 4）** 省的是"补入新请求时的填充计算"——左填充彻底消失，喂入 token 数降为 **1/6.6**
+- **Chunked Prefill（M6）** 省的是"补入要多开一次前向"——prefill 与 decode 合进同一步
 
 **推论**：推理优化的收益 = 被省成分的成本 − 新增机制的开销。选型前先算清被省的部分在成本结构中占多少——这也是每个推理引擎的性能调优起点。
 
 **两次出现“负收益 / 收益被吃光”（0.82x、1.25x vs 理想 2.00x），共同指向同一个东西：没有分页的 KV 管理开销。** 这就是 M4a 的动机。
 
-其中 1.25x 那个坑在 M4b Step 4 被拆成两半，只有一半真正修好了：
+那个 1.25x 的坑，被 M4b/M6 拆成两半、分两步修完：
 
-| 代价 | M2.5 | Step 4 分页 | 结论 |
+| 代价 | M2.5 | Step 4（分页） | M6（合流） |
 |---|---|---|---|
-| 补入时的**填充计算** | 每个补入前向要算 S 个位置（S≈当前批长） | 只算该请求自己的 L | ✅ **已消除** |
-| 补入需**一次独立前向** | 37 次总前向 | 37 次（不变） | ❌ **未消除** —— 那是 M6 Chunked Prefill 的活 |
+| 补入时的**填充计算** | 每个补入前向要算 S 个位置（S≈当前批长） | ✅ 只算该请求自己的 L | ✅ 只算 L |
+| 补入需**一次独立前向** | 7 次 | ❌ 仍是 7 次 | ✅ **0 次**（与 decode 同批） |
+| 喂入 token | 1463 | 222（6.6x ↓） | 222 |
+| 总前向次数 | 37 | 37 | **30** |
 
-> 这个“只解决了一半”的结论比单一加速比更有价值：它把“1.25x vs 理想 2.00x”的模糊猜测，
+> 这个“分两步才修完”的过程比单一加速比更有价值：它把“1.25x vs 理想 2.00x”的模糊猜测，
 > 变成了一张明确的待办清单。
+
+### 但是：墙钟反而更慢了
+
+同一负载下 **M2.5 306ms → Step 4 670ms → M6 624ms**。喂入 token 降了 **6.6 倍**，墙钟却慢了 2 倍。原因：
+
+| 原因 | 说明 |
+|---|---|
+| 逐序列注意力是 **Python 循环** | 每个序列 × 每个 query 位置调一次 `paged_attention`；M2.5 用的是 HF 里融合好的批式注意力 |
+| 小模型地板效应 | gpt2 每步要搬 0.5GB 权重，算力省下来也快不了多少 |
+
+**这恰好是 M5 的动机**：把 M4a/M4b 那三层循环翻译成 Triton kernel，才能把"算力优势"真正兑现成"墙钟优势"。
 
 ## 与真 SGLang 的差距（诚实清单）
 
 | 能力 | mini-sglang | 真 SGLang |
 |---|---|---|
 | Radix 树节点分裂 | 部分重叠直接放弃插入（宁缺毋错） | 分裂节点，重叠段共享 |
-| 槽位补位（refill） | 有；补入已做到**零填充**（页表 + varlen），但仍是**一次独立前向** | Continuous admission（prefill 与 decode 合并进同一 kernel，连前向次数也省） |
+| 槽位补位（refill） | 有；补入已做到**零填充 + 与 decode 合流**（M6），`admission_forwards == 0` | Continuous admission，且 prefill 与 decode 在同一个 CUDA kernel 内完成 |
 | KV 显存管理 | 分页池 + 页表 + 按需增长 + 完成即归还，调度器全程走页表（M4b Step 4） | 同上，但 gather 在 CUDA kernel 内完成 |
 | 服务层 | 无（库形态） | HTTP Server + tokenizer manager |
-| Kernel | PyTorch 算子 | FlashInfer / 自研 CUDA |
+| Kernel | PyTorch 算子（逐序列 Python 循环，所以墙钟反而不如 HF） | FlashInfer / 自研 CUDA（M5 要补的就是这一环） |
 
 > 上表是精简版。**模块级对照（官方 15 个模块）、三层覆盖度评估、缺口清单与补充计划**见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 
@@ -123,7 +139,7 @@ decode throughput  : 163.5 tokens/s
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：56 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 31 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比）。
+测试金字塔：56 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 42 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比）。
 
 ## 路线图
 
@@ -136,7 +152,7 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M4a** 分页 KV 池 + PagedAttention（按页表 gather + 多头缩放点积，与连续存储逐元素一致 < 1e-5）
 - [x] **M4b** 分页接入真实前向：自研 GPT-2 前向 ✅ / attention 换分页版 ✅ / 增量解码 ✅ / 接调度器 ✅（零填充 varlen 调度，喂入 token 降为 1/6.6）
 - [ ] **M5** 自研 Triton kernel（把 M4a 的 gather + 注意力翻译成 kernel）★ 差异化重点
-- [ ] **M6** Chunked Prefill（长 prompt 切块前向，压显存峰值）
+- [x] **M6** Chunked Prefill（prefill 与 decode 合流；`max_prefill_tokens` 给单步成本设上限）
 - [ ] **M7** CUDA Graph（消除 decode 阶段的 kernel launch 开销）
 - [ ] **M8** 采样策略（temperature / top_p / top_k）
 - [ ] **M9** 最小 HTTP 服务（`/v1/chat/completions`）
