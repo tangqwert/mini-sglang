@@ -31,8 +31,8 @@
 |---|---|---|---|
 | `kvcache` — `NaiveCacheManager` | `engine/kv_cache.py` | ✅ | 我直接用 HF `past_key_values`，未抽管理器接口 |
 | `kvcache` — `RadixCacheManager` | `engine/radix_cache.py` | ⚠️ | **无节点分裂、无驱逐、无 refcount**（mini 版放弃部分重叠插入） |
-| `kvcache` — `MHAKVCache`（分页池） | `engine/paged_kv.py` | 🚧 M4a | 我手写 PyTorch 版；官方在 CUDA kernel 内完成 gather |
-| `attention` — 后端抽象（fa / fi / trtllm） | `engine/paged_kv.py:paged_attention` | 🚧 M4a | **无后端抽象层**；无 FlashAttention / FlashInfer 集成 |
+| `kvcache` — `MHAKVCache`（分页池） | `engine/paged_kv.py` | ✅ M4a | 手写 PyTorch 版（gather 三步 + 多头点积）；官方在 CUDA kernel 内完成 gather |
+| `attention` — 后端抽象（fa / fi / trtllm） | `engine/paged_kv.py:paged_attention` | ⚠️ M4a | **无后端抽象层**；无 FlashAttention / FlashInfer 集成 |
 | `kernel` — 自研 CUDA（tvm-ffi + JIT） | — | ⬜ M5 | 我计划用 **Triton**，不引入 tvm-ffi |
 | `benchmark` | `benchmark/bench.py`、`verify_m2.py`、`verify_m3.py` | ✅ | 官方测吞吐/延迟；我额外做**逐 token 一致性**与 **`tokens_fed` 精确账本** |
 
@@ -118,7 +118,7 @@ M2   Continuous Batching（动态退出）        ✅
 M2.5 调度器 + 槽位连续准入                  ✅
 M3   Radix 前缀缓存（mini 版）              ✅
 M3.5 Radix 节点分裂 + 驱逐                  ⬜
-M4a  分页 KV 池 + PagedAttention           🚧
+M4a  分页 KV 池 + PagedAttention           ✅
 M4b  分页调度器（页表 + 抢占）              ⬜ P1
 M5   Triton kernel（gather + attention）   ⬜ P0 ★
 M6   Chunked Prefill                       ⬜ P0

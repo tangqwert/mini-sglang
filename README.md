@@ -9,8 +9,7 @@
 > 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
-- 全程测试驱动：47 项测试，每条优化路径都与朴素实现做逐 token 一致性验证
-  （M0–M3 共 39 项全绿；M4a 8 项中 6 项标 `xfail`，实现后自动转 XPASS 提醒摘标记）
+- 全程测试驱动：47 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
 
 ## 快速入门
 
@@ -19,7 +18,7 @@ git clone https://github.com/tangqwert/mini-sglang && cd mini-sglang
 python3 -m venv .venv && source .venv/bin/activate
 pip install torch transformers pytest
 
-# 1. 全部测试（单元 + 真模型集成；M4a 的 6 项暂标 xfail）
+# 1. 全部测试（单元 + 真模型集成）
 pytest tests/
 
 # 2. 看两条引擎的对比：同一长 prompt，朴素 vs KV Cache
@@ -47,7 +46,7 @@ decode throughput  : 163.5 tokens/s
 │ benchmark/  bench.py(--engine naive|kv)     │  测量与验证
 │             verify_m2.py / verify_m3.py     │
 ├─────────────────────────────────────────────┤
-│ engine/paged_kv.py      分页 KV 池 + 注意力 │  按页表 gather（M4a，进行中）
+│ engine/paged_kv.py      分页 KV 池 + 注意力 │  按页表 gather（M4a）
 │ engine/radix_cache.py   Radix 树前缀缓存     │  跨请求复用 KV
 │ engine/batching.py      动态退出批调度       │  多请求共享前向
 │ engine/kv_cache.py      增量解码(prefill+1)  │  免重复计算
@@ -98,7 +97,7 @@ decode throughput  : 163.5 tokens/s
 |---|---|---|
 | Radix 树节点分裂 | 部分重叠直接放弃插入（宁缺毋错） | 分裂节点，重叠段共享 |
 | 槽位补位（refill） | 有，但补入需一次独立前向 + 左填充碎片 | Continuous admission（与 decode 合并进同一 kernel，零填充） |
-| KV 显存管理 | 每请求整块 cache，clone 即拷贝 | PagedAttention 分页，零拷贝引用 |
+| KV 显存管理 | 有分页池 + gather（M4a），但调度器仍用整块 `DynamicCache`，clone 即拷贝 | PagedAttention 分页，零拷贝引用贯穿调度 |
 | 服务层 | 无（库形态） | HTTP Server + tokenizer manager |
 | Kernel | PyTorch 算子 | FlashInfer / 自研 CUDA |
 
@@ -108,7 +107,7 @@ decode throughput  : 163.5 tokens/s
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：37 项单元测试（毫秒级，假模型精确断言内部行为）+ 2 项真模型集成测试（GPT-2 前向，无 GPU 自动跳过）；M4a 另有 8 项（2 绿 + 6 xfail）。
+测试金字塔：37 项单元测试（毫秒级，假模型精确断言内部行为）+ 2 项真模型集成测试（GPT-2 前向，无 GPU 自动跳过）+ 8 项分页 KV / PagedAttention 测试。
 
 ## 路线图
 
@@ -118,7 +117,7 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M2.5** 调度器 + 槽位连续准入（冻结行腾位、pending 立刻补入；实测 1.25x vs 理想 2.00x）
 - [x] **M3** Radix 前缀缓存复用
 - [ ] **M3.5** Radix 节点分裂（部分重叠序列的完整缓存）
-- [ ] **M4a** 分页 KV 池 + PagedAttention（按页表 gather，消除 M3 的 clone 开销）← 进行中
+- [x] **M4a** 分页 KV 池 + PagedAttention（按页表 gather + 多头缩放点积，与连续存储逐元素一致 < 1e-5）
 - [ ] **M4b** 分页显存管理（页表搬运 + 驱逐 / 抢占）
 - [ ] **M5** 自研 Triton kernel（把 M4a 的 gather + 注意力翻译成 kernel）★ 差异化重点
 - [ ] **M6** Chunked Prefill（长 prompt 切块前向，压显存峰值）

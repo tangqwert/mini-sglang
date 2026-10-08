@@ -6,7 +6,6 @@
 """
 import math
 
-import pytest
 import torch
 
 from engine.paged_kv import PagedKVPool, paged_attention
@@ -46,9 +45,6 @@ class TestPool:
             pass
 
 
-# M4a 进行中：gather_layer 尚未实现。实现后【删掉这个装饰器】
-# （strict=True 会把"意外通过"报成失败，提醒你摘掉它）。
-@pytest.mark.xfail(strict=True, reason="M4a 进行中：待实现 PagedKVPool.gather_layer")
 class TestGather:
     def test_single_block_roundtrip(self):
         """单块：写 5 个 token，gather 出来应与写入值一致。"""
@@ -97,8 +93,6 @@ class TestGather:
         assert k0[0, 0, 0] == 0 and k2[0, 0, 0] == 2, "各层的 K/V 互不串"
 
 
-# M4a 进行中：paged_attention 尚未实现。实现后【删掉这个装饰器】。
-@pytest.mark.xfail(strict=True, reason="M4a 进行中：待实现 paged_attention")
 class TestPagedAttention:
     def test_matches_reference_single_head(self):
         torch.manual_seed(0)

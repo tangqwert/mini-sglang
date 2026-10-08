@@ -45,6 +45,8 @@ class PagedKVPool:
                  device="cpu"):
         self.block_size = block_size
         self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
         self.keys = torch.zeros(num_layers, num_blocks, block_size,
                                 num_heads, head_dim, device=device)
         self.values = torch.zeros_like(self.keys)
@@ -78,8 +80,15 @@ class PagedKVPool:
         Returns:
             (k_seq, v_seq)：各 [seq_len, num_heads, head_dim]
         """
-        # TODO(你): 三步——按页表索引 → 展平 → 截断。
-        raise NotImplementedError
+        # ① 按页表索引：从池子里挑出该序列占用的那些 block
+        k_blocks = self.keys[layer][block_table]        # [n_blocks, block_size, H, D]
+        v_blocks = self.values[layer][block_table]
+        # ② 展平：block_table 的顺序就是逻辑顺序、块内槽位也是顺序的，
+        #    所以直接 reshape 就拼成了"逻辑连续"的一长条
+        k_seq = k_blocks.reshape(-1, self.num_heads, self.head_dim)
+        v_seq = v_blocks.reshape(-1, self.num_heads, self.head_dim)
+        # ③ 截断：最后一个 block 通常没写满，只取前 seq_len 行
+        return k_seq[:seq_len], v_seq[:seq_len]
 
 
 def paged_attention(q: torch.Tensor, k_seq: torch.Tensor, v_seq: torch.Tensor) -> torch.Tensor:
@@ -101,5 +110,10 @@ def paged_attention(q: torch.Tensor, k_seq: torch.Tensor, v_seq: torch.Tensor) -
         3. out[h] = Σ_t w[h,t] * v_seq[t, h]    —— einsum('ht,thd->hd', w, v_seq)
         缩放因子 sqrt(head_dim)：量级补偿，GPT-2 原生注意力也这么做。
     """
-    # TODO(你): 三步注意力。写完和参考实现逐元素对比（测试里有）。
-    raise NotImplementedError
+    # ① 每个 head 独立打分：scores[h, t] = q[h] · k_seq[t, h] / sqrt(D)
+    scale = q.shape[-1] ** -0.5
+    scores = torch.einsum("hd,thd->ht", q, k_seq) * scale      # [H, T]
+    # ② 每个 head 独立 softmax（dim=-1 是序列维 t）
+    w = torch.softmax(scores, dim=-1)                          # [H, T]
+    # ③ 加权求和
+    return torch.einsum("ht,thd->hd", w, v_seq)                # [H, D]
