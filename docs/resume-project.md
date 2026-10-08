@@ -34,7 +34,10 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
   embed → 12 × (LayerNorm → 多头注意力 → 残差 → MLP → 残差) → lm_head，与 HF 输出
   **逐元素一致**（max|diff| ~5e-5）；再把 attention 换成「写进分页池 → 按页表 gather →
   paged_attention」，logits 不变（block_size ∈ {1,2,4,7,64} 均一致）
-- **测试驱动开发**：**62 项测试全部通过**（48 项假模型单元 + 14 项真模型），
+- **分页增量解码**：prefill（整条 prompt 一次前向）与 decode（每步 1 token、显式绝对
+  `position_ids`）共用同一个分页钩子；KV 全程住在分页池、每步按页表 gather，输出与 M0
+  朴素解码**逐 token 一致**，且不受 block_size（1/2/4/8）影响
+- **测试驱动开发**：**68 项测试全部通过**（48 项假模型单元 + 20 项真模型），
   每项优化均与朴素实现做逐 token 一致性验证，并用「喂入 token 数」精确账本断言开销
 
 ## 2. Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
@@ -90,11 +93,12 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M0–M2.5 | **39**（37 假模型单元 + 2 真模型集成） |
 | M4a 分页 KV + PagedAttention | 11 |
 | M4b Step 1/2 自研前向 + 分页接入 | 12 |
-| 合计 | **62（全部通过，无 xfail）** |
+| M4b Step 3 分页增量解码 | 6 |
+| 合计 | **68（全部通过，无 xfail）** |
 
 ## 5. 上简历前 Checklist
 
-- [x] `pytest tests/` 全绿（34 passed, 6 xfailed）
+- [x] `pytest tests/` 全绿（68 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）

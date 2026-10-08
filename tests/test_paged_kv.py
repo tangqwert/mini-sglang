@@ -158,7 +158,7 @@ class TestPagedAttentionHook:
         pool = PagedKVPool(num_blocks=8, block_size=BS, num_layers=2,
                            num_heads=H, head_dim=D)
         bt = allocate_for(pool, S)
-        hook = PagedAttentionHook(pool, bt, S)
+        hook = PagedAttentionHook(pool, bt)
         q, k, v = (torch.randn(1, H, S, D) for _ in range(3))
 
         out = hook(q, k, v, layer_idx=1)          # 只写第 1 层
@@ -181,7 +181,7 @@ class TestPagedAttentionHook:
         H, D, S = 2, 4, 5
         pool = PagedKVPool(num_blocks=8, block_size=4, num_layers=1,
                            num_heads=H, head_dim=D)
-        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S))
         q, k, v = (torch.randn(1, H, S, D) for _ in range(3))
         out = hook(q, k, v, layer_idx=0)
         assert torch.allclose(out[0, :, 0, :], v[0, :, 0, :], atol=1e-5)

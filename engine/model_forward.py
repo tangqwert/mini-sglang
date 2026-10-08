@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from engine.paged_kv import PagedAttentionHook
+
 
 @dataclass
 class GPT2Weights:
@@ -152,3 +154,44 @@ def gpt2_forward(input_ids: torch.LongTensor,
         # ── ③ 收尾：LN + 权重共享的输出投影（lm_head = wteᵀ）──
         x = _layernorm(x, weights.ln_f_w, weights.ln_f_b)
         return x @ weights.wte.T
+
+
+# ─────────────────── M4b Step 3：分页增量解码 ───────────────────
+
+def paged_generate(weights: GPT2Weights,
+                   prompt_ids: torch.LongTensor,
+                   n_new: int,
+                   pool,
+                   block_table: list) -> torch.LongTensor:
+    """用自研前向 + 分页 KV 池做贪心解码。
+
+    结构 = prefill 一步 + decode (n_new - 1) 步：
+      prefill：整条 prompt 一次前向（绝对位置 0..T-1），K/V 落进池
+      decode ：每步只喂 1 个新 token（绝对位置 T+k），K/V 追加进池，
+               注意力从池里 gather（`total` 就是"全部过去"，所以无需因果截断）
+
+    ⚠️ decode 步【必须】显式给 position_ids —— 此时 S=1，但它是第 pos 个 token。
+       漏了就退化成"一直按位置 0 算"，输出全错（M1 那轮踩过同类坑）。
+
+    Returns:
+        LongTensor[1, T + n_new]，prompt + 生成部分（含预 prompt）。
+    """
+    hook = PagedAttentionHook(pool, block_table)
+    device = prompt_ids.device
+    out = prompt_ids[0].tolist()
+
+    # ── prefill ──
+    logits = gpt2_forward(prompt_ids, weights, attention_fn=hook)
+    nxt = int(logits[0, -1].argmax())
+    out.append(nxt)
+
+    # ── decode：每步只喂 1 个 token ──
+    for _ in range(n_new - 1):
+        pos = len(out) - 1                       # 待喂 token 的绝对位置
+        logits = gpt2_forward(
+            torch.tensor([[nxt]], device=device), weights, attention_fn=hook,
+            position_ids=torch.tensor([[pos]], device=device))
+        nxt = int(logits[0, -1].argmax())
+        out.append(nxt)
+
+    return torch.tensor([out], device=device)

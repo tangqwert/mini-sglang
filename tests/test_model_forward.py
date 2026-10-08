@@ -14,7 +14,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from engine.model_forward import (_causal_attention, gpt2_forward,
-                                  load_gpt2_weights)
+                                  load_gpt2_weights, paged_generate)
+from engine.naive_decode import DecodingConfig, autoregressive_generate
 from engine.paged_kv import PagedAttentionHook, PagedKVPool, allocate_for
 
 
@@ -115,7 +116,7 @@ class TestPagedForward:
         S = ids.shape[1]
         pool = PagedKVPool(num_blocks=32, block_size=4, num_layers=cfg.n_layer,
                            num_heads=cfg.n_head, head_dim=cfg.n_embd // cfg.n_head)
-        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S))
 
         got = gpt2_forward(ids, weights, attention_fn=hook)
         with torch.no_grad():
@@ -135,10 +136,73 @@ class TestPagedForward:
         pool = PagedKVPool(num_blocks=S + 4, block_size=block_size,
                            num_layers=cfg.n_layer, num_heads=cfg.n_head,
                            head_dim=cfg.n_embd // cfg.n_head)
-        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S))
 
         got = gpt2_forward(ids, weights, attention_fn=hook)
         with torch.no_grad():
             ref = model(ids).logits
         assert torch.allclose(got, ref, atol=1e-4), \
             f"block_size={block_size} 时 max|diff| = {(got - ref).abs().max().item()}"
+
+
+class TestPagedIncremental:
+    """M4b Step 3：分页增量解码（prefill + 每步 1 个 token）。
+
+    与 M1 的本质区别：这里 KV 住在【分页池】里，每步靠页表 gather 出历史，
+    而不是 HF 的 DynamicCache。契约不变 —— 输出与 M0 朴素解码逐 token 一致。
+    """
+
+    def _pool(self, cfg, num_blocks, block_size):
+        return PagedKVPool(num_blocks=num_blocks, block_size=block_size,
+                           num_layers=cfg.n_layer, num_heads=cfg.n_head,
+                           head_dim=cfg.n_embd // cfg.n_head)
+
+    def test_hook_advances_write_position_once_per_forward(self, gpt2, weights):
+        """写入位置只在 layer 0 推进一次 —— 若 12 层各推进一次就会写乱。"""
+        model, tok = gpt2
+        cfg = model.config
+        prompt = tok("Hello world", return_tensors="pt").input_ids
+        T = prompt.shape[1]
+        pool = self._pool(cfg, num_blocks=32, block_size=4)
+        hook = PagedAttentionHook(pool, allocate_for(pool, T + 4))
+
+        logits = gpt2_forward(prompt, weights, attention_fn=hook)
+        assert hook.written == T, "prefill 后应恰好写入 T 个位置"
+        assert hook.kv_writes == cfg.n_layer * T
+
+        gpt2_forward(torch.tensor([[0]]), weights, attention_fn=hook,
+                     position_ids=torch.tensor([[T]]))
+        assert hook.written == T + 1, "decode 一步只应再写 1 个位置"
+        assert hook.kv_writes == cfg.n_layer * (T + 1)
+        assert logits.shape[-1] == cfg.vocab_size
+
+    def test_paged_generate_matches_naive(self, gpt2, weights):
+        """★ M4b Step 3 核心：分页增量解码 == M0 朴素解码（逐 token 一致）。"""
+        model, tok = gpt2
+        cfg = model.config
+        prompt = tok("The meaning of life is", return_tensors="pt").input_ids
+        T, N = prompt.shape[1], 6
+        pool = self._pool(cfg, num_blocks=32, block_size=4)
+
+        got = paged_generate(weights, prompt, N, pool, allocate_for(pool, T + N))
+        # 基线：M0 朴素解码，但用同一个自研前向（每步重算整条序列）
+        want = autoregressive_generate(
+            lambda ids: gpt2_forward(ids, weights),
+            prompt, DecodingConfig(max_new_tokens=N))
+
+        assert torch.equal(got, want), (got.tolist(), want.tolist())
+
+    @pytest.mark.parametrize("block_size", [1, 2, 4, 8])
+    def test_paged_generate_independent_of_block_size(self, gpt2, weights, block_size):
+        """增量解码同样不该受分页粒度影响。"""
+        model, tok = gpt2
+        cfg = model.config
+        prompt = tok("Hello world", return_tensors="pt").input_ids
+        T, N = prompt.shape[1], 4
+        pool = self._pool(cfg, num_blocks=T + N + 4, block_size=block_size)
+
+        got = paged_generate(weights, prompt, N, pool, allocate_for(pool, T + N))
+        want = autoregressive_generate(
+            lambda ids: gpt2_forward(ids, weights),
+            prompt, DecodingConfig(max_new_tokens=N))
+        assert torch.equal(got, want), f"block_size={block_size}"

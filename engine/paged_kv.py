@@ -134,46 +134,56 @@ def allocate_for(pool: PagedKVPool, seq_len: int) -> list:
 class PagedAttentionHook:
     """分页版 attention_fn —— 它是 M4a 与真实前向之间的桥。
 
-    用法（B=1 的 prefill 形态）::
+    用法（prefill + 增量 decode）::
 
         pool = PagedKVPool(num_blocks=32, block_size=4, num_layers=12,
                            num_heads=12, head_dim=64)
-        bt = allocate_for(pool, seq_len)
-        logits = gpt2_forward(ids, weights,
-                              attention_fn=PagedAttentionHook(pool, bt, seq_len))
+        hook = PagedAttentionHook(pool, allocate_for(pool, capacity))
+
+        logits = gpt2_forward(prompt, weights, attention_fn=hook)          # prefill
+        logits = gpt2_forward(tok, weights, attention_fn=hook,
+                              position_ids=torch.tensor([[T]]))            # decode
 
     数学与连续版**完全一样**，只是 K/V 中途绕了一圈池子::
 
         写进池（按页表定位） → 按页表 gather → 逐 query 的 paged_attention
 
-    所以结果必须逐元素一致 —— 这就是 PagedAttention 的"无损"声明。
+    写入位置的管理：一次 forward 会逐层调用本钩子，所以位置只在
+    `layer_idx == 0` 时推进一次（每层都推进就会写乱）。
+    钩子不关心"这是 prefill 还是 decode"，只看这次喂进来几个 token。
 
     约定：q/k/v 为 [B, H, S, Dh]；本实现只支持 B=1（批处理留到 M4b Step 4）。
     """
 
-    def __init__(self, pool: PagedKVPool, block_table: list, seq_len: int):
+    def __init__(self, pool: PagedKVPool, block_table: list, start: int = 0):
         self.pool = pool
         self.block_table = block_table
-        self.seq_len = seq_len
+        self.written = start      # 已写入池的 token 数 = 下一个待写位置
+        self._base = start        # 本次 forward 的写入起点
         self.kv_writes = 0        # 统计：写进池的 K/V 条数（每层每 token 各 1 条）
 
     def __call__(self, q, k, v, layer_idx: int):
         B, _, S, _ = k.shape
         assert B == 1, "PagedAttentionHook 目前只支持单序列（批处理见 M4b Step 4）"
-        assert S == self.seq_len, \
-            "本步骤只覆盖 prefill（S == seq_len）；增量解码见 M4b Step 3"
-        bs = self.pool.block_size
+        if layer_idx == 0:                     # 只在第 0 层推进写入窗口
+            self._base = self.written
+            self.written += S
+        base, total, bs = self._base, self.written, self.pool.block_size
+        assert len(self.block_table) * bs >= total, \
+            f"页表只给了 {len(self.block_table)} 个 block（容量 {len(self.block_table) * bs}），装不下 {total} 个位置"
 
-        # ① 把本层的 K/V 写进分页池：逻辑位置 t → block_table[t // bs] 的第 t % bs 个槽
+        # ① 把本层的 K/V 写进分页池：绝对位置 p → block_table[p // bs] 的第 p % bs 个槽
         for t in range(S):
-            self.pool.write(layer_idx, self.block_table[t // bs], t % bs,
+            p = base + t
+            self.pool.write(layer_idx, self.block_table[p // bs], p % bs,
                             k[0, :, t, :], v[0, :, t, :])
             self.kv_writes += 1
 
-        # ② 按页表 gather 成"逻辑连续"的 K/V（[S, H, Dh]）
-        k_seq, v_seq = self.pool.gather_layer(layer_idx, self.block_table, S)
+        # ② 按页表 gather 出【全部历史】的 K/V（[total, H, Dh]）
+        k_seq, v_seq = self.pool.gather_layer(layer_idx, self.block_table, total)
 
-        # ③ 逐 query 算注意力；query i 只能看前 i+1 个 key（因果）
-        outs = [paged_attention(q[0, :, i, :], k_seq[: i + 1], v_seq[: i + 1])
+        # ③ 逐 query 算注意力：query 的绝对位置是 base+i，只能看 key 的 0..base+i
+        outs = [paged_attention(q[0, :, i, :],
+                                k_seq[: base + i + 1], v_seq[: base + i + 1])
                 for i in range(S)]
         return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S, Dh]

@@ -9,7 +9,7 @@
 > 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
-- 全程测试驱动：62 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
+- 全程测试驱动：68 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
 
 ## 快速入门
 
@@ -107,7 +107,7 @@ decode throughput  : 163.5 tokens/s
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：48 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 14 项真模型测试（含 12 项「自研前向 vs HF」逐元素对比）。
+测试金字塔：48 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 20 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比）。
 
 ## 路线图
 
@@ -118,7 +118,7 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M3** Radix 前缀缓存复用
 - [ ] **M3.5** Radix 节点分裂（部分重叠序列的完整缓存）
 - [x] **M4a** 分页 KV 池 + PagedAttention（按页表 gather + 多头缩放点积，与连续存储逐元素一致 < 1e-5）
-- [ ] **M4b** 分页接入真实前向：自研 GPT-2 前向 ✅ / attention 换分页版 ✅ / 增量解码 ⬜ / 接调度器 ⬜
+- [ ] **M4b** 分页接入真实前向：自研 GPT-2 前向 ✅ / attention 换分页版 ✅ / 增量解码 ✅（prefill + decode 逐 token 一致）/ 接调度器 ⬜
 - [ ] **M5** 自研 Triton kernel（把 M4a 的 gather + 注意力翻译成 kernel）★ 差异化重点
 - [ ] **M6** Chunked Prefill（长 prompt 切块前向，压显存峰值）
 - [ ] **M7** CUDA Graph（消除 decode 阶段的 kernel launch 开销）
