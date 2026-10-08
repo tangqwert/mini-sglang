@@ -192,6 +192,12 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 > 与 SGLang 官方 [mini-sglang](https://github.com/sgl-project/mini-sglang) 的模块级对照、覆盖度与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 > **不计划实作**：Tensor Parallelism、Overlap Scheduling、ZMQ 多进程架构 —— 以读懂并讲清原理为目标。
 
+## 文档
+
+- [`docs/official-vs-mine.md`](docs/official-vs-mine.md) — 与官方项目的模块级对照、三层覆盖度评估、缺口清单
+- [`docs/interview-prep.md`](docs/interview-prep.md) — **面试准备手册**：10 道骨架题、30 道自测题、数字清单、薄弱点应对话术
+- [`docs/resume-project.md`](docs/resume-project.md) — 简历投递包：项目条目、面试深挖对照表、数据档案
+
 ## 环境
 
 ```bash
