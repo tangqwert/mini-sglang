@@ -9,7 +9,7 @@
 > 二者的交集只有 Radix Cache 一个概念。模块级对照与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B
-- 全程测试驱动：68 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
+- 全程测试驱动：87 项测试**全部通过**，每条优化路径都与朴素实现做逐 token 一致性验证
 
 ## 快速入门
 
@@ -25,9 +25,10 @@ pytest tests/
 python -m benchmark.bench --engine naive --model gpt2 --max-new-tokens 128
 python -m benchmark.bench --engine kv    --model gpt2 --max-new-tokens 128
 
-# 3. 端到端验证脚本：批处理 / 前缀缓存 的正确性与收益
+# 3. 端到端验证脚本：批处理 / 前缀缓存 / 分页调度 的正确性与收益
 python -m benchmark.verify_m2
 python -m benchmark.verify_m3
+python -m benchmark.verify_m4b   # 分页调度 vs M2.5 连续准入（量化"填充浪费"）
 ```
 
 预期输出（KV Cache 路径）：
@@ -42,18 +43,20 @@ decode throughput  : 163.5 tokens/s
 ## 架构
 
 ```
-┌─────────────────────────────────────────────┐
-│ benchmark/  bench.py(--engine naive|kv)     │  测量与验证
-│             verify_m2.py / verify_m3.py     │
-├─────────────────────────────────────────────┤
-│ engine/paged_kv.py      分页 KV 池 + 注意力 │  按页表 gather（M4a）
-│ engine/radix_cache.py   Radix 树前缀缓存     │  跨请求复用 KV
-│ engine/batching.py      动态退出批调度       │  多请求共享前向
-│ engine/kv_cache.py      增量解码(prefill+1)  │  免重复计算
-│ engine/naive_decode.py  朴素解码循环         │  基线（对照组）
-├─────────────────────────────────────────────┤
-│ transformers  (仅提供模型前向，禁用 generate) │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ benchmark/  bench.py(--engine naive|kv)      │  测量与验证
+│             verify_m2/m3/m4b.py              │
+├──────────────────────────────────────────────┤
+│ engine/paged_schedule.py  分页调度（零填充） │  页表 + varlen（M4b）
+│ engine/model_forward.py   自研 GPT-2 前向    │  接管 attention（M4b）
+│ engine/paged_kv.py       分页 KV 池 + 注意力 │  按页表 gather（M4a）
+│ engine/radix_cache.py     Radix 树前缀缓存   │  跨请求复用 KV
+│ engine/batching.py        动态退出批调度     │  多请求共享前向
+│ engine/kv_cache.py       增量解码(prefill+1) │  免重复计算
+│ engine/naive_decode.py    朴素解码循环       │  基线（对照组）
+├──────────────────────────────────────────────┤
+│ transformers （只取权重；M4b 起前向自研）    │
+└──────────────────────────────────────────────┘
 ```
 
 核心设计：解码循环与模型**解耦**——循环只认识 `logits_fn` / `kv_forward` 这两个可调用对象，
@@ -69,11 +72,12 @@ decode throughput  : 163.5 tokens/s
 | **Batching** | 4 请求批解码 vs 逐条 | 516 vs 606 ms（**1.18x**） | 收益 ∝ 请求数 × 权重搬运占比 |
 | **连续准入** | 4 请求（预算 1/5/1/5）｜槽位 2 | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入） | 理想 2.00x，实测 **1.25x** —— 差距即"补入需独立前向"的代价 |
 | **Radix 前缀缓存** | 3 请求共享 118-token 前缀 | **0.82x**（输出逐 token 一致） | 小模型 prefill 被权重搬运主导 |
+| **分页调度** | 1 长请求(153 tok) + 8 短请求｜槽位 2 | 喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；墙钟 818 → 650 ms | 前向**次数**不变（37），省的是每次前向里的填充计算 |
 
 > 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
 > 由于两者的权重规模差 4x、地板效应本就主导，长度差异不影响结论方向；若要严格 apples-to-apples，需在相同长度下重跑。
 
-## 核心洞察：四个"理论收益 ≠ 实测收益"的对照实验
+## 核心洞察：五个"理论收益 ≠ 实测收益"的对照实验
 
 每个里程碑都做了理论推导与实测的对照，四次实验共同指向同一条成本模型：
 
@@ -86,18 +90,30 @@ decode throughput  : 163.5 tokens/s
 - **连续准入** 省的是"已完成请求占着槽位空转"——但没有 PagedAttention 时，补入一条新请求需要
   一次**独立的前向**，把理想收益从 2.00x 压到 1.25x
 - **Radix Cache** 省的是"跨请求重复的 prefill 计算"——小模型 prefill 本身 ≈5ms，被 clone 与 Python 开销反超（0.82x）；真实收益场景是大模型 × 长前缀 × 高命中率（SGLang 用 PagedAttention 的零拷贝页引用消除 clone 开销）
+- **分页调度（M4b Step 4）** 省的是"补入新请求时的填充计算"——左填充彻底消失，喂入 token 数降为 **1/6.6**；
+  但**前向次数一个不少**（37 → 37），且墙钟只快 1.26x（Python 逐序列注意力开销 + 小模型地板效应）
 
 **推论**：推理优化的收益 = 被省成分的成本 − 新增机制的开销。选型前先算清被省的部分在成本结构中占多少——这也是每个推理引擎的性能调优起点。
 
-**两次出现"负收益 / 收益被吃光"（0.82x、1.25x vs 理想 2.00x），共同指向同一个东西：没有分页的 KV 管理开销。** 这就是 M4a 的动机。
+**两次出现“负收益 / 收益被吃光”（0.82x、1.25x vs 理想 2.00x），共同指向同一个东西：没有分页的 KV 管理开销。** 这就是 M4a 的动机。
+
+其中 1.25x 那个坑在 M4b Step 4 被拆成两半，只有一半真正修好了：
+
+| 代价 | M2.5 | Step 4 分页 | 结论 |
+|---|---|---|---|
+| 补入时的**填充计算** | 每个补入前向要算 S 个位置（S≈当前批长） | 只算该请求自己的 L | ✅ **已消除** |
+| 补入需**一次独立前向** | 37 次总前向 | 37 次（不变） | ❌ **未消除** —— 那是 M6 Chunked Prefill 的活 |
+
+> 这个“只解决了一半”的结论比单一加速比更有价值：它把“1.25x vs 理想 2.00x”的模糊猜测，
+> 变成了一张明确的待办清单。
 
 ## 与真 SGLang 的差距（诚实清单）
 
 | 能力 | mini-sglang | 真 SGLang |
 |---|---|---|
 | Radix 树节点分裂 | 部分重叠直接放弃插入（宁缺毋错） | 分裂节点，重叠段共享 |
-| 槽位补位（refill） | 有，但补入需一次独立前向 + 左填充碎片 | Continuous admission（与 decode 合并进同一 kernel，零填充） |
-| KV 显存管理 | 有分页池 + gather（M4a），但调度器仍用整块 `DynamicCache`，clone 即拷贝 | PagedAttention 分页，零拷贝引用贯穿调度 |
+| 槽位补位（refill） | 有；补入已做到**零填充**（页表 + varlen），但仍是**一次独立前向** | Continuous admission（prefill 与 decode 合并进同一 kernel，连前向次数也省） |
+| KV 显存管理 | 分页池 + 页表 + 按需增长 + 完成即归还，调度器全程走页表（M4b Step 4） | 同上，但 gather 在 CUDA kernel 内完成 |
 | 服务层 | 无（库形态） | HTTP Server + tokenizer manager |
 | Kernel | PyTorch 算子 | FlashInfer / 自研 CUDA |
 
@@ -107,7 +123,7 @@ decode throughput  : 163.5 tokens/s
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：48 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 20 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比）。
+测试金字塔：56 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 31 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比）。
 
 ## 路线图
 
@@ -118,7 +134,7 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M3** Radix 前缀缓存复用
 - [ ] **M3.5** Radix 节点分裂（部分重叠序列的完整缓存）
 - [x] **M4a** 分页 KV 池 + PagedAttention（按页表 gather + 多头缩放点积，与连续存储逐元素一致 < 1e-5）
-- [ ] **M4b** 分页接入真实前向：自研 GPT-2 前向 ✅ / attention 换分页版 ✅ / 增量解码 ✅（prefill + decode 逐 token 一致）/ 接调度器 ⬜
+- [x] **M4b** 分页接入真实前向：自研 GPT-2 前向 ✅ / attention 换分页版 ✅ / 增量解码 ✅ / 接调度器 ✅（零填充 varlen 调度，喂入 token 降为 1/6.6）
 - [ ] **M5** 自研 Triton kernel（把 M4a 的 gather + 注意力翻译成 kernel）★ 差异化重点
 - [ ] **M6** Chunked Prefill（长 prompt 切块前向，压显存峰值）
 - [ ] **M7** CUDA Graph（消除 decode 阶段的 kernel launch 开销）

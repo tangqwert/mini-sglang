@@ -37,7 +37,11 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 - **分页增量解码**：prefill（整条 prompt 一次前向）与 decode（每步 1 token、显式绝对
   `position_ids`）共用同一个分页钩子；KV 全程住在分页池、每步按页表 gather，输出与 M0
   朴素解码**逐 token 一致**，且不受 block_size（1/2/4/8）影响
-- **测试驱动开发**：**68 项测试全部通过**（48 项假模型单元 + 20 项真模型），
+- **分页调度（连续准入 + 零填充）**：调度器全程走页表——每条序列按需分页增长、
+  完成即归还显存；多请求 prompt 拍平成 **varlen** 一次前向（对应 flash-attn 的
+  `cu_seqlens` 语义），左填充彻底消失。同负载下喂入 token 数 **1463 → 222（6.6x）**、
+  填充位置 1220 → **0**，输出仍与朴素解码逐 token 一致
+- **测试驱动开发**：**87 项测试全部通过**（56 项假模型单元 + 31 项真模型），
   每项优化均与朴素实现做逐 token 一致性验证，并用「喂入 token 数」精确账本断言开销
 
 ## 2. Bullet ↔ 面试深挖对照表（每条都要能扛 10 分钟）
@@ -83,22 +87,27 @@ TDD 驱动，每一步都与朴素实现做逐 token 一致性验证，并用实
 | M2.5 连续准入（4 请求 / 2 槽位） | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入）；理想 2.00x，实测 **1.25x** | `tests/test_batching.py::TestContinuous` |
 | M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出**逐 token 一致** | `benchmark/verify_m3.py` |
 | M3 radix 耗时 | **0.82x** —— 小模型 prefill ≈5ms 被权重搬运主导，省下的计算 < clone + Python 开销 | `benchmark/verify_m3.py` |
+| M4b Step 4 分页调度 | 1 长请求(153 tok) + 8 短请求｜槽位 2：喂入 token **1463 → 222（6.6x）**；填充位置 1220 → **0**；前向次数 **37 → 37（不变）**；墙钟 818 → 650ms（1.26x） | `benchmark/verify_m4b.py` |
+| M4b Step 4 KV 显存 | 2.2 MB（批宽锁死 S=182 × 2 行，含填充）→ **1.2 MB**（峰值实际占用，完成即归还） | `benchmark/verify_m4b.py` |
 
 > ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
+> ⚠️ Step 4 的墙钟只快 1.26x 而 token 数降了 6.6x —— 因为 ① 前向次数没变（补入仍需独立前向）、
+> ② 逐序列注意力是 Python 循环（真引擎用 varlen kernel）、③ 小模型地板效应。**主动讲这条，比只报 6.6x 更可信。**
 
 **测试统计**（`pytest tests/ --collect-only`）：
 
 | 范围 | 数量 |
 |---|---|
 | M0–M2.5 | **39**（37 假模型单元 + 2 真模型集成） |
-| M4a 分页 KV + PagedAttention | 11 |
+| M4a 分页 KV + PagedAttention | 19 |
 | M4b Step 1/2 自研前向 + 分页接入 | 12 |
 | M4b Step 3 分页增量解码 | 6 |
-| 合计 | **68（全部通过，无 xfail）** |
+| M4b Step 4 分页调度（零填充 varlen） | 11 |
+| 合计 | **87（全部通过，无 xfail）** |
 
 ## 5. 上简历前 Checklist
 
-- [x] `pytest tests/` 全绿（68 passed，无 xfail）
+- [x] `pytest tests/` 全绿（87 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）

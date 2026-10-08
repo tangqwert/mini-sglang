@@ -43,6 +43,7 @@ class PagedKVPool:
     def __init__(self, num_blocks: int, block_size: int,
                  num_layers: int, num_heads: int, head_dim: int,
                  device="cpu"):
+        self.num_blocks = num_blocks
         self.block_size = block_size
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -187,3 +188,83 @@ class PagedAttentionHook:
                                 k_seq[: base + i + 1], v_seq[: base + i + 1])
                 for i in range(S)]
         return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S, Dh]
+
+
+# ─────────────── M4b Step 4：多序列（varlen）分页注意力 ───────────────
+
+def ensure_blocks(pool: PagedKVPool, block_table: list, total_len: int) -> None:
+    """确保页表装得下 total_len 个 token；不够就向池子领新块（页表原地增长）。
+
+    真引擎也是这么做的：显存按需分页增长，而不是一次性预留"最长可能长度"。
+    所以"分页省显存"的另一半兑现方式 = 分页表随序列变长而变长。
+    """
+    need = -(-total_len // pool.block_size)              # 向上取整
+    while len(block_table) < need:
+        block_table.append(pool.allocate())
+
+
+class BatchedPagedAttentionHook:
+    """多序列（varlen / ragged batch）分页注意力钩子。
+
+    输入是【拍平】的一维批次：N 条序列本次要算的 token 首尾相接成
+    ``[1, H, S_total, Dh]``（真引擎里就是 flash-attn 的 varlen 布局）。
+    每条序列有自己的页表与写入起点，注意力逐序列独立计算。
+
+    ⇒ **完全不需要左填充**：既没有 pad 占显存，也没有 pad 白算。
+      这正是抹掉 M2.5 那笔账（填充碎片 + "补入得填充到当前批长 S"）的地方。
+
+    真引擎对应物是 ``flash_attn_varlen_func`` 的 ``cu_seqlens``；本类用
+    Python 循环 + 分页 gather 实现同一语义（M5 再翻译成 kernel）。
+
+    Args:
+        pool: PagedKVPool。
+        block_tables: 每条序列的页表（调用方需保证容量，见 ensure_blocks）。
+        bases: 每条序列【本次 forward 之前】已写入池的 token 数。
+        new_lens: 每条序列【本次 forward】要算的 token 数（decode 步全为 1）。
+    """
+
+    def __init__(self, pool: PagedKVPool, block_tables: list,
+                 bases: list, new_lens: list):
+        self.pool = pool
+        self.block_tables = list(block_tables)
+        self.base = list(bases)
+        self.new_lens = list(new_lens)
+        self.n_seq = len(self.new_lens)
+        self.written = [b + n for b, n in zip(self.base, self.new_lens)]
+        # 每条序列在拍平维度上的起点（cu_seqlens）
+        self.cu = [0]
+        for n in self.new_lens:
+            self.cu.append(self.cu[-1] + n)
+        self.kv_writes = 0            # 统计：写进池的 K/V 条数（每层每 token 各 1）
+
+    def __call__(self, q, k, v, layer_idx: int):
+        B, _, S_total, _ = k.shape
+        assert B == 1 and S_total == self.cu[-1], \
+            f"拍平长度对不上：前向给了 {S_total}，页表声明 {self.cu[-1]}"
+        bs = self.pool.block_size
+
+        # ① 写：各序列的新 token 落到各自页表的对应槽位
+        #    （绝对位置 p → 第 p // bs 块的第 p % bs 槽；每层都写）
+        for s in range(self.n_seq):
+            b, n, tbl = self.base[s], self.new_lens[s], self.block_tables[s]
+            assert len(tbl) * bs >= b + n, \
+                f"序列 {s} 页表容量不足（{len(tbl) * bs} < {b + n}）：请先 ensure_blocks"
+            for t in range(n):
+                p = b + t
+                self.pool.write(layer_idx, tbl[p // bs], p % bs,
+                                k[0, :, self.cu[s] + t, :],
+                                v[0, :, self.cu[s] + t, :])
+                self.kv_writes += 1
+
+        # ② 逐序列 gather，再逐 query 算注意力
+        #    （query 的绝对位置 base+t 只能看到 key 的 0..base+t —— 因果性）
+        outs = []
+        for s in range(self.n_seq):
+            b, n, tbl = self.base[s], self.new_lens[s], self.block_tables[s]
+            k_seq, v_seq = self.pool.gather_layer(layer_idx, tbl, b + n)
+            for t in range(n):
+                outs.append(paged_attention(q[0, :, self.cu[s] + t, :],
+                                            k_seq[: b + t + 1],
+                                            v_seq[: b + t + 1]))
+        # 拍平顺序 = 序列顺序 × 序列内顺序，与输入对齐
+        return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S_total, Dh]
