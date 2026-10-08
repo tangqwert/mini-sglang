@@ -85,7 +85,7 @@ def _merge_heads(x):
     return x.transpose(1, 2).reshape(B, S, H * Dh)
 
 
-def _causal_attention(q, k, v):
+def _causal_attention(q, k, v, layer_idx: int | None = None):
     """标准因果缩放点积注意力（M4a 的 paged_attention 就是它的"分页版"）。
 
     q/k/v 都是 [B, H, S, Dh] → 返回 [B, H, S, Dh]。
@@ -93,6 +93,9 @@ def _causal_attention(q, k, v):
     注意 Sq 与 Sk 可以不等（增量解码时 Sq=1、Sk=全长）：
       i 行 j 列的因果掩码 = 上三角（j > i+Sk-Sq 时屏蔽）。
       用 `triu(diagonal=1)` 在 [Sq, Sk] 上直接构造即可，两种形态都正确。
+
+    `layer_idx` 只是为了与其它 attention_fn 统一签名（分页版靠它定位层），
+    连续版用不上。
     """
     Dh = q.shape[-1]
     scores = q @ k.transpose(-1, -2) / Dh ** 0.5
@@ -116,9 +119,9 @@ def gpt2_forward(input_ids: torch.LongTensor,
         weights: `load_gpt2_weights` 的产物。
         position_ids: LongTensor[B, S]；None 时用 0..S-1。
             ⚠️ 增量解码【必须】显式传 —— 此时 S=1，但它是第 pos 个 token。
-        attention_fn: (q, k, v) -> out，各为 [B, H, S, Dh]。
-            默认连续版 `_causal_attention`；**M4b Step 2 会传入分页版**
-            （通过闭包捕获页池与页表），这就是替换 attention 的接缝。
+        attention_fn: (q, k, v, layer_idx) -> out，各为 [B, H, S, Dh]。
+            默认连续版 `_causal_attention`；**M4b Step 2 传入分页版**
+            （PagedAttentionHook），这就是替换 attention 的接缝。
 
     Returns:
         logits [B, S, vocab]。
@@ -134,12 +137,12 @@ def gpt2_forward(input_ids: torch.LongTensor,
         x = weights.wte[input_ids] + weights.wpe[position_ids]
 
         # ── ② 逐层 ──
-        for W in weights.layers:
+        for layer_idx, W in enumerate(weights.layers):
             h = _layernorm(x, W["ln1_w"], W["ln1_b"])
             qkv = h @ W["attn_w"] + W["attn_b"]                 # [B, S, 3D]
             q, k, v = (_split_heads(t, weights.n_head)
                        for t in qkv.split(D, dim=2))            # 各 [B, H, S, Dh]
-            y = attention_fn(q, k, v)
+            y = attention_fn(q, k, v, layer_idx)
             x = x + _merge_heads(y) @ W["proj_w"] + W["proj_b"]  # 残差
 
             h = _layernorm(x, W["ln2_w"], W["ln2_b"])

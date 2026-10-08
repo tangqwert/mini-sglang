@@ -117,3 +117,63 @@ def paged_attention(q: torch.Tensor, k_seq: torch.Tensor, v_seq: torch.Tensor) -
     w = torch.softmax(scores, dim=-1)                          # [H, T]
     # ③ 加权求和
     return torch.einsum("ht,thd->hd", w, v_seq)                # [H, D]
+
+
+# ─────────────────── M4b：把分页池接进自研前向 ───────────────────
+
+def allocate_for(pool: PagedKVPool, seq_len: int) -> list:
+    """给一条长度为 seq_len 的序列领足够的 block，返回它的页表（block id 列表）。
+
+    每 ⌈seq_len / block_size⌉ 个 token 占一个 block。
+    同一张页表对【所有层】通用 —— 因为池子的第一维就是层，block_id 在层维度之后索引。
+    """
+    n_blocks = -(-seq_len // pool.block_size)          # 向上取整
+    return [pool.allocate() for _ in range(n_blocks)]
+
+
+class PagedAttentionHook:
+    """分页版 attention_fn —— 它是 M4a 与真实前向之间的桥。
+
+    用法（B=1 的 prefill 形态）::
+
+        pool = PagedKVPool(num_blocks=32, block_size=4, num_layers=12,
+                           num_heads=12, head_dim=64)
+        bt = allocate_for(pool, seq_len)
+        logits = gpt2_forward(ids, weights,
+                              attention_fn=PagedAttentionHook(pool, bt, seq_len))
+
+    数学与连续版**完全一样**，只是 K/V 中途绕了一圈池子::
+
+        写进池（按页表定位） → 按页表 gather → 逐 query 的 paged_attention
+
+    所以结果必须逐元素一致 —— 这就是 PagedAttention 的"无损"声明。
+
+    约定：q/k/v 为 [B, H, S, Dh]；本实现只支持 B=1（批处理留到 M4b Step 4）。
+    """
+
+    def __init__(self, pool: PagedKVPool, block_table: list, seq_len: int):
+        self.pool = pool
+        self.block_table = block_table
+        self.seq_len = seq_len
+        self.kv_writes = 0        # 统计：写进池的 K/V 条数（每层每 token 各 1 条）
+
+    def __call__(self, q, k, v, layer_idx: int):
+        B, _, S, _ = k.shape
+        assert B == 1, "PagedAttentionHook 目前只支持单序列（批处理见 M4b Step 4）"
+        assert S == self.seq_len, \
+            "本步骤只覆盖 prefill（S == seq_len）；增量解码见 M4b Step 3"
+        bs = self.pool.block_size
+
+        # ① 把本层的 K/V 写进分页池：逻辑位置 t → block_table[t // bs] 的第 t % bs 个槽
+        for t in range(S):
+            self.pool.write(layer_idx, self.block_table[t // bs], t % bs,
+                            k[0, :, t, :], v[0, :, t, :])
+            self.kv_writes += 1
+
+        # ② 按页表 gather 成"逻辑连续"的 K/V（[S, H, Dh]）
+        k_seq, v_seq = self.pool.gather_layer(layer_idx, self.block_table, S)
+
+        # ③ 逐 query 算注意力；query i 只能看前 i+1 个 key（因果）
+        outs = [paged_attention(q[0, :, i, :], k_seq[: i + 1], v_seq[: i + 1])
+                for i in range(S)]
+        return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S, Dh]

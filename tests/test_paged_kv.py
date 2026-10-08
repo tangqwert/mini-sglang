@@ -8,7 +8,8 @@ import math
 
 import torch
 
-from engine.paged_kv import PagedKVPool, paged_attention
+from engine.paged_kv import (PagedAttentionHook, PagedKVPool, allocate_for,
+                             paged_attention)
 
 
 def reference_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -137,3 +138,50 @@ class TestPagedAttention:
 
         assert torch.allclose(out_paged, out_contig, atol=1e-5), \
             "分页布局改变了注意力结果——PagedAttention 的无损性被破坏"
+
+
+class TestPagedAttentionHook:
+    """M4b Step 2 的零件：领页表 + 把 K/V 路由过分页池。"""
+
+    def test_allocate_for_rounds_up(self):
+        pool = PagedKVPool(num_blocks=8, block_size=4, num_layers=1,
+                           num_heads=2, head_dim=4)
+        assert len(allocate_for(pool, 1)) == 1
+        assert len(allocate_for(pool, 4)) == 1
+        assert len(allocate_for(pool, 5)) == 2
+        assert len(pool.free_blocks) == 8 - 4, "前三次共领走 4 个 block"
+
+    def test_hook_writes_then_gathers_back(self):
+        """钩子写进池的 K/V，按页表 gather 回来应与写进去的一致（只差转置）。"""
+        torch.manual_seed(0)
+        H, D, BS, S = 3, 8, 4, 10
+        pool = PagedKVPool(num_blocks=8, block_size=BS, num_layers=2,
+                           num_heads=H, head_dim=D)
+        bt = allocate_for(pool, S)
+        hook = PagedAttentionHook(pool, bt, S)
+        q, k, v = (torch.randn(1, H, S, D) for _ in range(3))
+
+        out = hook(q, k, v, layer_idx=1)          # 只写第 1 层
+        assert out.shape == (1, H, S, D)
+        assert hook.kv_writes == S
+
+        k_seq, v_seq = pool.gather_layer(1, bt, S)
+        assert torch.allclose(k_seq, k[0].transpose(0, 1), atol=1e-6)
+        assert torch.allclose(v_seq, v[0].transpose(0, 1), atol=1e-6)
+
+        k0, _ = pool.gather_layer(0, bt, S)
+        assert torch.all(k0 == 0), "不该写到别的层"
+
+    def test_causal_truncation_is_applied(self):
+        """query 0 只能看 1 个 key —— 若因果截断丢了，结果会不同。
+
+        只有 1 个 key 时 softmax 权重恒为 1，所以 query 0 的输出应等于 v[0]。
+        """
+        torch.manual_seed(1)
+        H, D, S = 2, 4, 5
+        pool = PagedKVPool(num_blocks=8, block_size=4, num_layers=1,
+                           num_heads=H, head_dim=D)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+        q, k, v = (torch.randn(1, H, S, D) for _ in range(3))
+        out = hook(q, k, v, layer_idx=0)
+        assert torch.allclose(out[0, :, 0, :], v[0, :, 0, :], atol=1e-5)

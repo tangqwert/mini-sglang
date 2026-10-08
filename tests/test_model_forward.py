@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from engine.model_forward import (_causal_attention, gpt2_forward,
                                   load_gpt2_weights)
+from engine.paged_kv import PagedAttentionHook, PagedKVPool, allocate_for
 
 
 @pytest.fixture(scope="module")
@@ -80,13 +81,13 @@ class TestGPT2Forward:
         n_head, D = model.config.n_head, model.config.n_embd
         seen = []
 
-        def spy(q, k, v):
-            seen.append(tuple(q.shape))
+        def spy(q, k, v, layer_idx):
+            seen.append((layer_idx, tuple(q.shape)))
             return _causal_attention(q, k, v)
 
         got = gpt2_forward(ids, weights, attention_fn=spy)
         assert len(seen) == model.config.n_layer, "每层都应调用一次"
-        assert seen[0] == (1, n_head, ids.shape[1], D // n_head)
+        assert seen[0] == (0, (1, n_head, ids.shape[1], D // n_head))
         assert torch.allclose(got, gpt2_forward(ids, weights), atol=1e-6)
 
     def test_batched_input_matches_single(self, gpt2, weights):
@@ -98,3 +99,46 @@ class TestGPT2Forward:
         batched = gpt2_forward(torch.cat([a, b], dim=0), weights)
         assert torch.allclose(batched[0], gpt2_forward(a, weights)[0], atol=1e-4)
         assert torch.allclose(batched[1], gpt2_forward(b, weights)[0], atol=1e-4)
+
+
+class TestPagedForward:
+    """M4b Step 2：把 attention 换成“分页版”后，logits 必须不变。
+
+    这就是 PagedAttention 的“无损”声明在【真模型】上的验证 ——
+    M4a 只在孤立张量上验过，这里第一次跑在 12 层 GPT-2 上。
+    """
+
+    def test_paged_forward_matches_hf(self, gpt2, weights):
+        model, tok = gpt2
+        cfg = model.config
+        ids = tok("Hello world, this is a test", return_tensors="pt").input_ids
+        S = ids.shape[1]
+        pool = PagedKVPool(num_blocks=32, block_size=4, num_layers=cfg.n_layer,
+                           num_heads=cfg.n_head, head_dim=cfg.n_embd // cfg.n_head)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+
+        got = gpt2_forward(ids, weights, attention_fn=hook)
+        with torch.no_grad():
+            ref = model(ids).logits
+
+        assert torch.allclose(got, ref, atol=1e-4), \
+            f"max|diff| = {(got - ref).abs().max().item()}"
+        assert hook.kv_writes == cfg.n_layer * S, "每层每个 token 都应写一次池"
+
+    @pytest.mark.parametrize("block_size", [1, 2, 4, 7, 64])
+    def test_block_size_does_not_affect_result(self, gpt2, weights, block_size):
+        """分页粒度（每块多大）不应影响结果 —— “无损”的更强形式。"""
+        model, tok = gpt2
+        cfg = model.config
+        ids = tok("Hello world, this is a test", return_tensors="pt").input_ids
+        S = ids.shape[1]
+        pool = PagedKVPool(num_blocks=S + 4, block_size=block_size,
+                           num_layers=cfg.n_layer, num_heads=cfg.n_head,
+                           head_dim=cfg.n_embd // cfg.n_head)
+        hook = PagedAttentionHook(pool, allocate_for(pool, S), S)
+
+        got = gpt2_forward(ids, weights, attention_fn=hook)
+        with torch.no_grad():
+            ref = model(ids).logits
+        assert torch.allclose(got, ref, atol=1e-4), \
+            f"block_size={block_size} 时 max|diff| = {(got - ref).abs().max().item()}"
