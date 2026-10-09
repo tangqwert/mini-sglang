@@ -310,15 +310,15 @@ chunked-prefill   triton   cuda   pytorch   from-scratch   inference-engine
 
 ```
 SGEMM 算子优化（CUDA C++）                                2026.09 – 至今
-个人项目 | github.com/tangqwert/sgemm-cuda
+个人项目 | 严格 FP32 | RTX 4070 Laptop（sm_89）
 
 · 统一验证框架：自建 harness（CPU 参考验语义 + cuBLAS 对照测性能 + ncu 采证），
-  每版本输出 CSV，数据可复现；RTX 4070 Laptop / sm_89 / 严格 FP32。
-· 优化阶梯：naive → shared memory 分块 → 2D 寄存器分块（BM×BN×BK=128×128×8，
-  TM×TN=8×8，64 累加器/线程），N=4096 下 1.11 → 8.95 TFLOPS（8.0x），
+  每版本输出 CSV，数据可复现。
+· 优化阶梯：naive → shared memory 分块 → 2D 寄存器分块（BM×BN×BK=128×128×8、
+  TM×TN=8×8、每线程 64 累加器），N=4096 下 1.11 → 8.95 TFLOPS（8.0x），
   达同精度 cuBLAS 的 73.4%。
-· 过程纪律：定「没有正确性 PASS 不测速、没有 ncu 数据不算完成」为铁律，
-  逐版本记录 DRAM 吞吐 / sectors-per-request / bank conflict / long-scoreboard stall。
+· 瓶颈定位：用 ncu 证明 naive 版瓶颈在 L1TEX 访存管线（l1tex__throughput 96.5%、
+  DRAM throughput 3.4%），而非 DRAM 带宽或访存延迟，据此确定后续优化方向。
 ```
 
 **数据出处**（`sgemm-cuda/bench.csv` + `results/v0_baseline.csv`，N=4096）：
@@ -330,7 +330,14 @@ SGEMM 算子优化（CUDA C++）                                2026.09 – 至�
 | **加速比** | **8.0x** | — | — |
 
 > **后续更新点**：v4 float4 / v5 双缓冲 / v6 warp tiling 走完后换数字。
-> 同时记得把 `docs/ROADMAP.md` 里各版本记的 `____` 补上（那是简历数字的出处）。
-> ⚠️ 当前 `kernels/sgemm_v3_2d_tiling.cuh` 等还是 uncommitted 状态，**记得 commit + push**，
-> 否则 GitHub 上看到的还是空骨架。
+> 同时把 `docs/ROADMAP.md` 里各版本记的 `____` 补上（那是简历数字的出处）。
+>
+> **不附仓库时的应对**（2026-10-09 用户决定 SGEMM 不上 GitHub）：
+> 这条无链接可查，面试官可能问「有代码吗」。准备两句：
+> ① 「本地仓库，能现场画三级分块图／讲 ncu 数据」→ 所以 `docs/v3_layout.svg` 要能默画；
+> ② 便携方案：把 `kernels/ + bench/ + bench.csv` 打成 zip，面试时可直接发。
+> ⚠️ 但**别在简历里写「开源」或暗示有链接** —— 查不到比不写更糟。
+>
+> **代码已本地提交**（`04b12b4 feat(v3): 2D register tiling`），未推送。
+> `docs/v3_learning_prompt.md` 故意**不入仓**（含「把 prompt 复制给 AI 让它讲」的痕迹，与「熟悉 CUDA」矛盾）。
 
