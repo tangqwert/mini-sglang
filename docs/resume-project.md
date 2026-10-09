@@ -37,7 +37,8 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 
 · 引擎架构：从零实现推理全链路（KV Cache → Continuous Batching → Radix 前缀缓存 →
   PagedAttention → Chunked Prefill → CUDA Graph），解码循环与模型解耦、后端可整体替换。
-· 显存与调度：手写 prefill + 单 token 增量前向，gpt2 TPOT 29.2 → 6.5 ms（4.51x）；实现
+· 显存与调度：手写 prefill + 单 token 增量前向，长 prompt 下 TPOT 29.2 → 6.5 ms（4.51x）；
+  并在 Qwen2.5-0.5B / Qwen3-0.6B 复现（1.95x / 2.08x），定位出收益受权重搬运约束；实现
   分页 KV 池 + varlen 零填充调度，喂入 token 1463 → 222（6.6x）、填充位置 1220 → 0。
 · 自研 kernel：以 Triton 手写分页版 flash attention（页表访存 + online softmax + GQA），
   端到端 565 → 301 ms（1.88x）；CUDA Graph 整步捕获，decode 步加速 5.3x（B=8）。
@@ -64,8 +65,12 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 
 - **KV Cache 增量解码**：基于注意力位置不变性手写 prefill + 单 token 增量前向，输出与朴素解码逐 token 一致；
   gpt2 696-token prompt 下 29.2 → 6.5 ms/token（**4.51x**）
-- **跨模型瓶颈分析**：对照实验发现收益被「权重搬运地板效应」压缩（Qwen2.5-0.5B 仅 **1.95x**，
-  短 prompt 反而 **0.94x 微负**），归纳出「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
+- **跨模型瓶颈分析**：同一优化在 3 个模型上复现 —— gpt2(124M/696tok) **4.51x**、
+  Qwen2.5-0.5B(0.5B/601tok) **1.95x**、Qwen3-0.6B(0.6B/704tok) **2.08x**；归纳出
+  「每步耗时 = 权重搬运（固定，∝参数量）+ 序列计算（∝长度 × 每 token 注意力开销）」成本模型，
+  并解释两个反直觉现象：① 短 prompt 下 **0.94x 微负**（省的计算抵不过 cache 读写开销）；
+  ② **Qwen3-0.6B 参数更多，收益反而略高于 Qwen2.5-0.5B** —— 因其 head_dim 128 × 16 头，
+  每 token 注意力开销是 Qwen2.5 的 ~2.7 倍，序列项占比更高（收益 ∝ 被省成分的成本占比）
 - **Continuous Batching**：实现左填充 + attention_mask + 显式 position_ids 的多请求批解码与
   per-request 动态退出，4 请求实测 **3.0x**（理想 4.0x），且与逐条输出逐 token 一致
 - **槽位连续准入**：实现调度器 + 固定槽位，冻结行立刻让位、pending 队列补入新请求
@@ -141,6 +146,7 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 |---|---|---|
 | M1 KV cache（gpt2, **696** tok） | 3.739s → 0.828s；29.2 → 6.5 ms/token，**4.51x** | `benchmark/results/m0_naive_long.json` / `m1_kv_long.json` |
 | M1 KV cache（Qwen2.5-0.5B, **601** tok） | 3.705s → 1.900s；28.9 → 14.8 ms/token，**1.95x** | `benchmark/results/m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
+| M1 KV cache（**Qwen3-0.6B**, 704 tok） | 8.282s → 3.980s；64.7 → 31.1 ms/token，**2.08x** | `benchmark/results/m0_naive_qwen3_long.json` / `m1_kv_qwen3_long.json` |
 | M1 短 prompt（gpt2, **5** tok） | 0.738s → 0.783s；5.8 → 6.1 ms/token，**0.94x（微负）** | `benchmark/results/m0_naive_short.json` / `m1_kv_short.json` |
 | M2 batching（4 请求，各 24 token） | 553 → 178 ms，**3.0x**（理想 4.0x）；批内每 forward 5.8 → 7.4 ms（填充行 + 记账） | `benchmark/verify_m2.py` |
 | M2 batching 修正 | ⚠️ 旧值 **1.18x** 是**测量 bug**：benchmark 让批量路径跑第一个，独占了 CUDA/cuBLAS 冷启动（首次 581ms vs 预热后 183ms） | `benchmark/verify_m2.py` 注释 |
@@ -158,7 +164,7 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 | M8 Qwen3 前向 | 与 HF 逐元素一致 max\|diff\| **~2e-5**（fp32, 28 层）；接入完整引擎后与朴素解码逐 token 一致 | `tests/test_qwen3_forward.py` |
 | M5 微基准（单层 decode） | seq_len 128–2048、block_size 8/16/32：1.0–2.0x，且**不随 seq_len 单调** | `benchmark/verify_m5.py` |
 
-> ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
+> ⚠️ 三个模型的长 prompt 实验**长度不同**（gpt2 696 / Qwen2.5 601 / Qwen3 704），因为各 tokenizer 切分粒度不同，无法凑完全一致。报告中必须写清，否则被追问会措手不及。**跨模型只比加速比，不比绝对耗时。**
 > ⚠️ **Step 4 / M6 的墙钟曾【比 M2.5 慢 2 倍】**（306ms → 624ms），而喂入 token 降了 6.6 倍。
 > 原因：① 逐序列注意力是 Python 循环（每层十来个 kernel + 一圈 Python）；② 小模型地板效应。
 > **M5 的 Triton kernel 把这段差距补上了（565 → 301 ms，1.88x）**，墙钟追平 M2.5 而 token 数低 6.6 倍。
@@ -188,7 +194,7 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 ### 代码 / 仓库
 - [x] `pytest tests/` 全绿（150 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
-- [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
+- [x] README 数字与 `benchmark/results/` 一致（696 / 601 / 704 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）
 - [x] GitHub 定位声明（README 顶部，解决同名混淆）
 - [x] `benchmark/results/*.json` **已入库** —— 之前被 `.gitignore` 漏掉，会让"数字可现场核对"变成空话

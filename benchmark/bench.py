@@ -27,6 +27,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--prompt", default="The meaning of life is")
+    parser.add_argument("--prompt-repeat", type=int, default=1,
+                        help="把 --prompt 重复 N 次再喂进去（长 prompt 实验用，"
+                             "让“同一长度同一 prompt 下换模型”这类对照可复现）")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--engine", choices=["naive", "kv"], default="naive",
                         help="naive=M0 整条序列重算；kv=M1 KV cache 增量解码")
@@ -45,7 +48,8 @@ def main() -> None:
 
     # 关键：必须搬到 device 上。否则 generated 留在 CPU，而 logits_fn 算出的
     # next_token 在 GPU，循环里的 torch.cat 会因设备不一致报错。
-    input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids.to(device)  # [1, T]
+    text = (args.prompt + " ") * args.prompt_repeat
+    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)  # [1, T]
     cfg = DecodingConfig(max_new_tokens=args.max_new_tokens)
 
     # 两条引擎路径对齐成同一个 generate(ids) 接口——测量代码完全复用，保证公平

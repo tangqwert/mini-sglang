@@ -1,0 +1,8 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "engine": "naive",
+  "prompt_tokens": 704,
+  "new_tokens": 128,
+  "total_s": 8.281973148999896,
+  "tokens_per_s": 15.45525416433605
+}

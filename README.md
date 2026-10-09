@@ -85,6 +85,7 @@ decode throughput  : 163.5 tokens/s
 |---|---|---|---|
 | **KV Cache** | gpt2，696-token prompt | 29.2 → 6.5 ms/token（**4.5x**） | 消除序列长度维度的重复计算 |
 | KV Cache | Qwen2.5-0.5B，601-token prompt | 28.9 → 14.8 ms/token（**1.95x**） | 收益被权重搬运地板压缩 |
+| KV Cache | **Qwen3-0.6B**，704-token prompt | 64.7 → 31.1 ms/token（**2.08x**） | 现代模型（GQA + QK-Norm + SwiGLU）同结论 |
 | KV Cache | gpt2，5-token prompt | 5.8 → 6.1 ms/token（0.94x，略负） | 短上下文无浪费可省，机制开销反超 |
 | **Batching** | 4 请求批解码 vs 逐条（各 24 token） | 553 → 178 ms（**3.0x**，理想 4.0x） | 权重搬运被 4 条分摊；缺口 = 填充行 + mask 拼接 + Python 记账 |
 | **连续准入** | 4 请求（预算 1/5/1/5）｜槽位 2 | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入） | 理想 2.00x，实测 **1.25x** —— 差距即"补入需独立前向"的代价 |
@@ -96,8 +97,8 @@ decode throughput  : 163.5 tokens/s
 | **CUDA Graph（M7）** | decode 步（每行 1 token）| A 逐行 hook → C 图路径：B=8 时 **22.4 → 4.2 ms（5.3x）**；B=1 时 10.1 → 3.3 ms | 图消掉的 launch 次数**与 B 无关**，所以 C 列几乎不随 B 变 |
 | ⚠️ 同一负载的墙钟 | 同上 | M2.5 306ms → Step4 670ms → M6 624ms → **M6+Triton 301ms** | 分页路径先慢 2 倍（Python 循环），M5 追平 |
 
-> 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
-> 由于两者的权重规模差 4x、地板效应本就主导，长度差异不影响结论方向；若要严格 apples-to-apples，需在相同长度下重跑。
+> 注：三次长 prompt 实验的 prompt 长度不同（gpt2 696 / Qwen2.5 601 / Qwen3 704 token，出处见 `benchmark/results/*.json`）。
+> 各 tokenizer 切分粒度不同，无法凑完全一致的 token 数。**跨模型只比加速比，不比绝对耗时。**
 >
 > **数字出处**：M0/M1 的原始测量在 [`benchmark/results/`](benchmark/results/)（每次计时都入库，可直接核对）；
 > M2 之后的对照全部由 `benchmark/verify_m*.py` 现跑现测 —— 想验证就自己跑一遍。
@@ -110,7 +111,10 @@ decode throughput  : 163.5 tokens/s
 每步耗时 = 权重搬运（固定，∝模型大小） + 序列计算（∝上下文长度）
 ```
 
-- **KV Cache** 省的是"序列计算"——模型越小、prompt 越长，收益越大（4.5x ↔ 1.95x 的差异由此而来）
+- **KV Cache** 省的是"序列计算"——收益 ∝ 被省成分在总耗时中的占比：
+  gpt2(124M) **4.51x** → Qwen2.5-0.5B **1.95x** → Qwen3-0.6B **2.08x**。
+  ⚠️ Qwen3-0.6B 参数**更多**、收益却**更高**——它 head_dim 128 × 16 头，每 token 注意力开销
+  是 Qwen2.5 的 ~2.7 倍，序列项占比反而更大。**成本模型看的是"占比"，不是"绝对参数量"。**
 - **Batching** 省的是"N 条请求重复的权重搬运"——4 请求批实测 **3.0x**（理想 4.0x），缺口来自填充行的无效计算与 Python 记账
   > ⚠️ 这个数字最初被写成 **1.18x**：当时的 benchmark 让批量路径**跑第一个**，
   > 于是把 CUDA 上下文 / cuBLAS 的冷启动开销（首次 581ms vs 预热后 183ms）全算在它头上。
