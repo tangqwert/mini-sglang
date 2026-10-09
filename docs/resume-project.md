@@ -18,32 +18,40 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 
 ### §1A 投递版（**只放这 5 条**）
 
-> ⚠️ 简历「项目经历」一栏放得下 4–5 条。下面 5 条是**精筛版**：每条一个能力信号，
-> 不重不漏。更细的 12 条在 §1B，**不上简历**，只做面试弹药。
+> 组织方式对齐大厂简历惯例（参考了一份 TensorRT C++ 推理 runtime 的写法）：
+> **每条 = 能力小标题 + 做了什么 + 怎么做的（技术名词）+ 量化（含基线与场景）**；
+> 最后一条留给「正确性验证」，因为那是 Infra 岗最能拉开差距的一条。
+> 更细的 12 条在 §1B，**不上简历**，只做面试弹药。
 
-> **Mini-SGLang：从零实现轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch / Triton）
+> **Mini-SGLang：从零实现的轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch / Triton）
 > 2026.09 - 至今　github.com/tangqwert/mini-sglang
 
-- **从零实现推理引擎全链路**：朴素解码 → KV Cache → Continuous Batching（含槽位连续准入）
-  → Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill
-  → 自研 GPT-2 前向 → **自研 Triton kernel**；**129 项测试全绿**，每条优化路径都与朴素实现
-  做**逐 token 一致性**验证
-- **KV Cache 与跨模型瓶颈分析**：基于注意力位置不变性手写 prefill + 单 token 增量前向，
-  gpt2 696-token prompt 下 29.2 → 6.5 ms/token（**4.51x**）；跨模型对照实验发现收益被
-  「权重搬运地板效应」压缩（Qwen2.5-0.5B 仅 1.95x、短 prompt 反而 0.94x 微负），
-  归纳出「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
-- **分页 KV + 零填充 varlen 调度 + Chunked Prefill**：分页池 + 页表按需增长 + 完成即归还；
-  多请求 prompt 拍平成 varlen 一次前向（flash-attn 的 `cu_seqlens` 语义），左填充彻底消失
-  —— 同负载喂入 token **1463 → 222（6.6x）**、填充位置 1220 → **0**；再把 prefill 与 decode
-  合进同一步，总前向 37 → **30**、补入独立前向 7 → **0**
-- **自研 GPT-2 前向 + 自研 Triton 分页注意力 kernel**：脱离 `transformers` 从权重手写
-  完整前向（与 HF 逐元素一致，max|diff| ~5e-5，含手写 LayerNorm / 多头切分 / 因果掩码）；
-  再用 Triton 把「查页表 gather + 因果掩码 + online softmax + 加权求和」封进**一个** kernel
-  （分页版 flash attention），端到端 **565 → 301 ms（1.88x）**，输出与调度统计与 PyTorch
-  后端完全一致
-- **性能建模与诚实结论**：归纳「优化收益 = 被省成分的成本 − 新增机制的开销」，并**主动报告
-  3 个负结果/反常现象**及其成因与下一步：Radix 缓存 **0.82x**；分页调度墙钟一度**反而慢 2 倍**，
-  定位到 Python 循环的 kernel 启动开销后用自研 kernel 追平；剩余短板 split-K 已定位待补
+- **引擎架构**：从零实现推理引擎全链路（朴素解码 → KV Cache → Continuous Batching →
+  Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill →
+  自研 GPT-2 前向 → **自研 Triton kernel**）；解码循环与模型解耦，只注入
+  `logits_fn` / `kv_forward` / `attention_fn` 三类可调用对象，因此后续所有分页、合流、
+  kernel 替换**均未改动调度循环本体**
+- **KV cache 与显存管理**：基于注意力位置不变性手写 prefill + 单 token 增量前向；实现
+  请求级分页 KV 池与页表（按需增长、完成即归还）。在 RTX 4070 Laptop、gpt2-124M fp32 上，
+  相较 decode 阶段无 KV cache 的基线，prompt=696 / output=128 的 greedy decoding
+  平均每 token 由 **29.2 ms 降至 6.5 ms（TPOT 4.51x）**；并通过跨模型对照实验定位出收益受
+  「权重搬运地板效应」约束（Qwen2.5-0.5B 仅 1.95x、短 prompt 反而 0.94x 微负），归纳出
+  「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
+- **批调度与合流**：实现左填充 + attention_mask + 显式 position_ids 的动态退出批解码、
+  槽位连续准入（冻结行立刻让位、pending 补入）、以及 Chunked Prefill（prefill 与 decode
+  合进同一次 varlen 前向，`max_prefill_tokens` 限制单步成本）。在 4 请求 / 各 24 token
+  场景下相较逐条串行，墙钟由 **553 ms 降至 178 ms（3.0x，理想 4.0x）**；同负载下补入
+  独立前向由 **7 次降至 0 次**、喂入 token 由 **1463 降至 222（6.6x）**、填充位置 1220 → 0
+- **自研 Triton kernel**：脱离 `transformers` 从权重手写 GPT-2 前向（手写 LayerNorm /
+  多头切分 / 因果掩码，与 HF 逐元素一致，max|diff| ~5e-5）；再以 Triton 实现**分页版
+  flash attention**（页表访存 + 绝对位置因果掩码 + online softmax，严格 fp32 不开 TF32）。
+  端到端墙钟由 **565 ms 降至 301 ms（1.88x）**，输出与调度统计与 PyTorch 后端逐 token 一致
+- **正确性验证与诚实结论**：构建 **129 项测试**（77 项假模型/纯张量单元 + 52 项真模型
+  集成），覆盖 KV cache 边界、前缀树完整命中、分页增量解码、Triton vs PyTorch 参考等；
+  每条优化路径均与朴素实现做**逐 token 全等**验证（严于数值对齐），并以 `tokens_fed`
+  账本精确断言调度开销；**主动报告 3 个负结果/反常现象**（Radix 前缀缓存 0.82x、短 prompt
+  KV cache 0.94x、分页后墙钟一度反慢 2 倍）及成因与下一步；另发现并修正 benchmark 的
+  CUDA 冷启动偏差（同一代码首次 **581 ms vs 预热后 183 ms**）
 
 ### §1B 面试弹药（**不上简历**，但每条都要能讲）
 
