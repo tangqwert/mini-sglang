@@ -37,7 +37,7 @@ Mini-SGLang：从零实现的轻量级 LLM 推理引擎                  2026.09
 
 · 引擎架构：从零实现推理全链路（KV Cache → Continuous Batching → Radix 前缀缓存 →
   PagedAttention → Chunked Prefill → CUDA Graph），解码循环与模型解耦、后端可整体替换。
-· 显存与调度：手写 prefill + 单 token 增量前向，长 prompt 下 TPOT 29.2 → 6.5 ms（4.51x）；
+· 显存与调度：prefill + 单 token 增量前向，长 prompt 下 TPOT 29.2 → 6.5 ms（4.51x）；
   并在 Qwen2.5-0.5B / Qwen3-0.6B 复现（1.95x / 2.08x），定位出收益受权重搬运约束；实现
   分页 KV 池 + varlen 零填充调度，喂入 token 1463 → 222（6.6x）、填充位置 1220 → 0。
 · 自研 kernel：以 Triton 手写分页版 flash attention（页表访存 + online softmax + GQA），
