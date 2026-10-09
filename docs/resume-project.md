@@ -18,44 +18,54 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 
 ### §1A 投递版（**只放这 5 条**）
 
-> 组织方式对齐大厂简历惯例（参考了一份 TensorRT C++ 推理 runtime 的写法）：
-> **每条 = 能力小标题 + 做了什么 + 怎么做的（技术名词）+ 量化（含基线与场景）**；
-> 最后一条留给「正确性验证」，因为那是 Infra 岗最能拉开差距的一条。
-> 更细的 12 条在 §1B，**不上简历**，只做面试弹药。
+> ⚠️ **简历不是文档。** 之前那版每条 5–6 行，一页简历根本放不下，而且把最漂亮的
+> 「4.51x」埋在了第二段。重写原则：
+> ① 每条 **≤2 行**（约 90 个汉字）② 数字**前置** ③ 每条只讲**一个能力信号**。
+>
+> | 条目 | 想传递的信号 |
+> |---|---|
+> | 引擎架构 | 系统设计能力（解耦、可替换） |
+> | KV Cache 与显存管理 | 核心算法 + 最硬的数字 4.51x |
+> | 批调度与 Chunked Prefill | 调度/流式推理的理解 |
+> | 自研 kernel 与图捕获 | **差异化**：真的写了 kernel，不只调框架 |
+> | 架构无关前向与工程严谨性 | 跨架构能力 + 会验证 + 敢报负结果 |
 
-> **Mini-SGLang：从零实现的轻量级 LLM 推理引擎**（个人项目｜Python / PyTorch / Triton）
-> 2026.09 - 至今　github.com/tangqwert/mini-sglang
+**纯文本粘贴版**（直接复制到 Word / LaTeX / 超级简历，不含任何 markdown 标记）：
 
-- **引擎架构**：从零实现推理引擎全链路（朴素解码 → KV Cache → Continuous Batching →
-  Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill →
-  自研 GPT-2 前向 → **自研 Triton kernel** → **CUDA Graph 整步捕获** → **Qwen3 架构前向**）；
-  解码循环与模型解耦，只注入 `logits_fn` / `kv_forward` / `attention_fn` 三类可调用对象，
-  因此后续所有分页、合流、kernel 替换、甚至**换模型架构**都**未改动调度循环本体**
-- **KV cache 与显存管理**：基于注意力位置不变性手写 prefill + 单 token 增量前向；实现
-  请求级分页 KV 池与页表（按需增长、完成即归还）。在 RTX 4070 Laptop、gpt2-124M fp32 上，
-  相较 decode 阶段无 KV cache 的基线，prompt=696 / output=128 的 greedy decoding
-  平均每 token 由 **29.2 ms 降至 6.5 ms（TPOT 4.51x）**；并通过跨模型对照实验定位出收益受
-  「权重搬运地板效应」约束（Qwen2.5-0.5B 仅 1.95x、短 prompt 反而 0.94x 微负），归纳出
-  「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
-- **批调度与合流**：实现左填充 + attention_mask + 显式 position_ids 的动态退出批解码、
-  槽位连续准入（冻结行立刻让位、pending 补入）、以及 Chunked Prefill（prefill 与 decode
-  合进同一次 varlen 前向，`max_prefill_tokens` 限制单步成本）。在 4 请求 / 各 24 token
-  场景下相较逐条串行，墙钟由 **553 ms 降至 178 ms（3.0x，理想 4.0x）**；同负载下补入
-  独立前向由 **7 次降至 0 次**、喂入 token 由 **1463 降至 222（6.6x）**、填充位置 1220 → 0
-- **自研 kernel 与整步图捕获**：以 Triton 实现**分页版 flash attention**（页表访存 +
-  绝对位置因果掩码 + online softmax + **GQA 头索引**，严格 fp32 不开 TF32），端到端墙钟
-  **565 → 301 ms（1.88x）**；再用 **CUDA Graph** 把整步几十个 kernel 折成 1 次 launch ——
-  decode 步在 B=8 时 **22.4 → 4.2 ms（5.3x）**、B=1 时 10.1 → 3.3 ms，
-  且图路径耗时几乎不随批大小变（因为 launch 次数与 B 无关）
-- **架构无关前向与正确性验证**：脱离 `transformers` 从权重手写
-  GPT-2 前向（手写 LayerNorm / 多头切分 / 因果掩码，与 HF 逐元素一致 max|diff| ~5e-5）；
-  并实现 **Qwen3-0.6B 前向**，覆盖 GPT-2 之外的全部现代组件（**GQA + RoPE + RMSNorm +
-  SwiGLU + QK-Norm**），与 HF 逐元素一致（~2e-5），且接入完整引擎（分页 + Chunked Prefill +
-  两个注意力后端）后仍与朴素解码**逐 token 一致**。构建 **150 项测试**（90 假模型/纯张量 +
-  60 真模型），每条优化路径均与朴素实现做**逐 token 全等**验证（严于数值对齐），
-  并以 `tokens_fed` 账本精确断言调度开销；**主动报告 3 个负结果/反常现象**
-  （Radix 前缀缓存 0.82x、短 prompt KV cache 0.94x、分页后墙钟一度反慢 2 倍）及成因与
-  下一步；另发现并修正 benchmark 的 CUDA 冷启动偏差（同一代码首次 **581 vs 183 ms**）
+```
+Mini-SGLang：从零实现的轻量级 LLM 推理引擎                    2026.09 – 至今
+个人项目 | Python / PyTorch / Triton | github.com/tangqwert/mini-sglang
+
+· 引擎架构：从零实现推理引擎全链路（KV Cache 增量解码 → Continuous Batching → Radix
+  前缀缓存 → PagedAttention 分页调度 → Chunked Prefill → CUDA Graph）；解码循环与模型
+  解耦，只注入 logits_fn / attention_fn 等可调用对象，后续分页、kernel 替换与换模型架构
+  均未改动循环本体。
+· KV Cache 与显存管理：基于注意力位置不变性手写 prefill + 单 token 增量前向，gpt2
+  prompt=696 / output=128 下 TPOT 由 29.2 ms 降至 6.5 ms（4.51x）；进而实现分页 KV 池 +
+  页表（按需增长、完成即归还）与 varlen 零填充调度；同负载下喂入 token 总数
+  1463 → 222（6.6x）、填充位置 1220 → 0。
+· 批调度与 Chunked Prefill：动态退出批解码 + 槽位连续准入，4 请求批解码 3.0x（理想
+  4.0x）；Chunked Prefill 将 prefill 与 decode 合进同一次 varlen 前向，总前向次数
+  37 → 30、补入独立前向 7 → 0。
+· 自研 kernel 与图捕获：以 Triton 手写分页版 flash attention（页表访存 + 绝对位置因果
+  掩码 + online softmax + GQA 头索引），端到端墙钟 565 → 301 ms（1.88x）；再以 CUDA
+  Graph 将整步数十个 kernel 折成一次 launch，decode 步 22.4 → 4.2 ms（5.3x @ B=8）。
+· 架构无关前向与工程严谨性：脱离 transformers 手写 GPT-2 与 Qwen3 前向，覆盖 GQA /
+  RoPE / RMSNorm / SwiGLU / QK-Norm，与 HF 逐元素一致（max|diff| < 5e-5）；150 项测试
+  全绿，每条优化路径均与朴素实现做逐 token 全等验证；主动报告 3 个负结果并定位根因。
+```
+
+> **排版提示**：
+> - 「Mini-SGLang」这一行是条目标题，左侧项目名、右侧时间、下一行放链接与关键词
+> - 数字加粗（Word 里选中 → Ctrl+B）：**4.51x / 6.6x / 3.0x / 1.88x / 5.3x / 150**
+> - 若版面不够，**先删第 3 条**（批调度）—— 它是最容易被追问、数字也最弱的一条
+> - ⚠️ **关于上面的硬换行**：它们是按「10.5pt + 2cm 页边距（≈95 半宽字符/行）」排的，
+>   实测每行 ≤87 字符。如果你的字号/边距不同，粘进 Word 后手动换行可能对不齐 ——
+>   直接删掉行尾的硬换行、让 Word 自动折行即可，不影响内容。
+
+> **被砍掉的内容去哪了**：上面为了压缩，丢掉了「成本模型」「跨模型对照（1.95x / 0.94x）」
+> 「B=1 时图也有 3.1x」「90 假模型 + 60 真模型」这些细节。它们**全部在 §1B**，
+> 是面试时挖深的弹药 —— **简历负责拿面试，§1B 负责过面试。**
 
 ### §1B 面试弹药（**不上简历**，但每条都要能讲）
 
@@ -193,7 +203,8 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 - [ ] GitHub About 栏 + topics ← **见 §7，5 分钟**
 
 ### 简历（投递前必做）
-- [ ] 项目经历栏换成 **§1A 的 5 条**（不要直接把 §1B 的 12 条堆上去）
+- [ ] 把 **§1A 的「纯文本粘贴版」**直接粘进简历项目经历栏（不要粘 §1B 的 12 条）
+- [ ] 六个关键数字加粗：**4.51x / 6.6x / 3.0x / 1.88x / 5.3x / 150**
 - [ ] 按 **§8** 清理现有简历的问题（Vibe Coding / 实习时长 / "熟悉结构" / `xxx` 占位 / 技能栏措辞）
 - [ ] 导出 PDF，检查：① 一页 ② 链接可点 ③ 无错别字
 - [ ] **用手机打开仓库链接**，确认 README 排版没崩（架构图、表格、嵌套代码块）
