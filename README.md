@@ -10,8 +10,8 @@
 不是为了调用推理框架，而是为了回答一个问题：**vLLM/SGLang 到底在优化什么，为什么，以及优化在什么场景下不划算。**
 
 - 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B ｜ Python / PyTorch / Triton
-- **129 项测试全部通过**，每条优化路径都与朴素实现做**逐 token 一致性**验证
-- **7 组带数字的对照实验**（含 3 个诚实的负结果/反常现象）+ 1 个自研 Triton kernel（端到端 **1.88x**）
+- **138 项测试全部通过**，每条优化路径都与朴素实现做**逐 token 一致性**验证
+- **8 组带数字的对照实验**（含 3 个诚实的负结果/反常现象）+ 1 个自研 Triton kernel + 自研 CUDA Graph 解码
 
 > ⚠️ **与官方同名项目的区分**：本仓库是**教学向**实现，与 SGLang 官方的
 > [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级 benchmark）**无代码或血缘关系**。
@@ -41,6 +41,7 @@ python -m benchmark.verify_m3
 python -m benchmark.verify_m4b   # 分页调度 vs M2.5 连续准入（量化"填充浪费"）
 python -m benchmark.verify_m6    # 三方对照：M2.5 / 分页 / Chunked Prefill
 python -m benchmark.verify_m5    # PyTorch 分页注意力 vs Triton kernel
+python -m benchmark.verify_m7    # eager decode 步 vs CUDA Graph（三路对照拆变量）
 ```
 
 预期输出（KV Cache 路径）：
@@ -57,9 +58,10 @@ decode throughput  : 163.5 tokens/s
 ```
 ┌──────────────────────────────────────────────┐
 │ benchmark/  bench.py(--engine naive|kv)      │  测量与验证
-│             verify_m2/m3/m4b/m5/m6.py        │
+│             verify_m2/m3/m4b/m5/m6/m7.py     │
 ├──────────────────────────────────────────────┤
 │ engine/paged_schedule.py  分页/合流调度      │  页表 + varlen（M4b/M6）
+│ engine/graph_decode.py     CUDA Graph 解码   │  整步折成 1 次 launch（M7）
 │ engine/model_forward.py   自研 GPT-2 前向    │  接管 attention（M4b）
 │ engine/paged_kv.py       分页 KV 池 + 注意力 │  按页表 gather（M4a）
 │ engine/triton_paged.py    分页注意力 kernel  │  Triton（M5）
@@ -89,6 +91,7 @@ decode throughput  : 163.5 tokens/s
 | **Chunked Prefill（M6）** | 同上 | 总前向 37 → **30**；补入独立前向 7 → **0**；prefill/decode 同批 **7 步** | prefill 与 decode 合流，额外前向消失 |
 | **Triton kernel（M5）** | M6 负载，端到端 | PyTorch 分页 **565 → 301 ms（1.88x）**，输出与调度统计完全一致 | 把每层十来个 kernel + 一圈 Python 循环折成 **1 个** kernel |
 | Triton kernel 微基准 | 单层 decode，seq_len 128–2048 | 1.0–2.0x，且**不随 seq_len 单调** | PyTorch 版是**启动受限**（耗时几乎不随长度变），Triton 版是**带宽受限** |
+| **CUDA Graph（M7）** | decode 步（每行 1 token）| A 逐行 hook → C 图路径：B=8 时 **22.4 → 4.2 ms（5.3x）**；B=1 时 10.1 → 3.3 ms | 图消掉的 launch 次数**与 B 无关**，所以 C 列几乎不随 B 变 |
 | ⚠️ 同一负载的墙钟 | 同上 | M2.5 306ms → Step4 670ms → M6 624ms → **M6+Triton 301ms** | 分页路径先慢 2 倍（Python 循环），M5 追平 |
 
 > 注：gpt2 与 Qwen 两次长 prompt 实验的 prompt 长度不同（696 / 601 token，出处见 `benchmark/results/*.json`）。
@@ -97,9 +100,9 @@ decode throughput  : 163.5 tokens/s
 > **数字出处**：M0/M1 的原始测量在 [`benchmark/results/`](benchmark/results/)（每次计时都入库，可直接核对）；
 > M2 之后的对照全部由 `benchmark/verify_m*.py` 现跑现测 —— 想验证就自己跑一遍。
 
-## 核心洞察：七个"理论收益 ≠ 实测收益"的对照实验
+## 核心洞察：八个"理论收益 ≠ 实测收益"的对照实验
 
-每个里程碑都做了理论推导与实测的对照，七次实验共同指向同一条成本模型：
+每个里程碑都做了理论推导与实测的对照，八次实验共同指向同一条成本模型：
 
 ```
 每步耗时 = 权重搬运（固定，∝模型大小） + 序列计算（∝上下文长度）
@@ -116,6 +119,7 @@ decode throughput  : 163.5 tokens/s
 - **分页调度（M4b Step 4）** 省的是"补入新请求时的填充计算"——左填充彻底消失，喂入 token 数降为 **1/6.6**
 - **Chunked Prefill（M6）** 省的是"补入要多开一次前向"——prefill 与 decode 合进同一步
 - **Triton kernel（M5）** 省的是"注意力实现里的 kernel 启动与 Python 开销"——把每层十来个 kernel 折成 1 个（端到端 565 → 301 ms）
+- **CUDA Graph（M7）** 省的是"**整步**几十个 kernel 的 launch 开销"——它消掉的次数与 batch 无关，所以图路径耗时几乎不随 B 变（3.3 → 4.2 ms），而 eager 从 10.1 涨到 22.4
 
 **推论**：推理优化的收益 = 被省成分的成本 − 新增机制的开销。选型前先算清被省的部分在成本结构中占多少——这也是每个推理引擎的性能调优起点。
 
@@ -173,7 +177,7 @@ M4b/M6 之后同一负载 **M2.5 306ms → Step4 670ms → M6 624ms**：喂入 t
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：77 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 52 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比、「Triton kernel vs PyTorch 参考」逐元素对比）。
+测试金字塔：86 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 52 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比、「Triton kernel vs PyTorch 参考」逐元素对比）。
 
 ## 路线图
 
@@ -188,7 +192,8 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [x] **M5** 自研 Triton kernel（分页版 flash attention：查页表 + 因果掩码 + online softmax 封进 **1 个** kernel；端到端 **1.88x**）★
 - [ ] **M5.5** split-K / flash-decoding（把 KV 维也切开并行，解决"单序列只有 H 个 program、SM 大量空转"）
 - [x] **M6** Chunked Prefill（prefill 与 decode 合流；`max_prefill_tokens` 给单步成本设上限）
-- [ ] **M7** CUDA Graph（消除 decode 阶段的 kernel launch 开销）
+- [x] **M7** CUDA Graph（decode 步 B=8 时 **22.4 → 4.2 ms（5.3x）**；B=1 时 10.1 → 3.3 ms）
+- [ ] **M7.5** 把图路径接进调度器（当前为独立解码工具 + 基准；调度器仍需按 batch size 选图）
 - [ ] **M8** 采样策略（temperature / top_p / top_k）
 - [ ] **M9** 最小 HTTP 服务（`/v1/chat/completions`）
 

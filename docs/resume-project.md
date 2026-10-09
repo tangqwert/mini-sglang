@@ -28,7 +28,7 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 
 - **引擎架构**：从零实现推理引擎全链路（朴素解码 → KV Cache → Continuous Batching →
   Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 → Chunked Prefill →
-  自研 GPT-2 前向 → **自研 Triton kernel**）；解码循环与模型解耦，只注入
+  自研 GPT-2 前向 → **自研 Triton kernel** → **CUDA Graph 整步捕获**）；解码循环与模型解耦，只注入
   `logits_fn` / `kv_forward` / `attention_fn` 三类可调用对象，因此后续所有分页、合流、
   kernel 替换**均未改动调度循环本体**
 - **KV cache 与显存管理**：基于注意力位置不变性手写 prefill + 单 token 增量前向；实现
@@ -42,11 +42,13 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
   合进同一次 varlen 前向，`max_prefill_tokens` 限制单步成本）。在 4 请求 / 各 24 token
   场景下相较逐条串行，墙钟由 **553 ms 降至 178 ms（3.0x，理想 4.0x）**；同负载下补入
   独立前向由 **7 次降至 0 次**、喂入 token 由 **1463 降至 222（6.6x）**、填充位置 1220 → 0
-- **自研 Triton kernel**：脱离 `transformers` 从权重手写 GPT-2 前向（手写 LayerNorm /
-  多头切分 / 因果掩码，与 HF 逐元素一致，max|diff| ~5e-5）；再以 Triton 实现**分页版
-  flash attention**（页表访存 + 绝对位置因果掩码 + online softmax，严格 fp32 不开 TF32）。
-  端到端墙钟由 **565 ms 降至 301 ms（1.88x）**，输出与调度统计与 PyTorch 后端逐 token 一致
-- **正确性验证与诚实结论**：构建 **129 项测试**（77 项假模型/纯张量单元 + 52 项真模型
+- **自研 kernel 与整步图捕获**：脱离 `transformers` 从权重手写 GPT-2 前向（手写 LayerNorm /
+  多头切分 / 因果掩码，与 HF 逐元素一致，max|diff| ~5e-5）；以 Triton 实现**分页版
+  flash attention**（页表访存 + 绝对位置因果掩码 + online softmax，严格 fp32 不开 TF32），
+  端到端墙钟 **565 → 301 ms（1.88x）**；再用 **CUDA Graph** 把整步几十个 kernel 折成
+  1 次 launch —— decode 步在 B=8 时 **22.4 → 4.2 ms（5.3x）**、B=1 时 10.1 → 3.3 ms，
+  且图路径耗时几乎不随批大小变（因为 launch 次数与 B 无关）
+- **正确性验证与诚实结论**：构建 **138 项测试**（86 项假模型/纯张量单元 + 52 项真模型
   集成），覆盖 KV cache 边界、前缀树完整命中、分页增量解码、Triton vs PyTorch 参考等；
   每条优化路径均与朴素实现做**逐 token 全等**验证（严于数值对齐），并以 `tokens_fed`
   账本精确断言调度开销；**主动报告 3 个负结果/反常现象**（Radix 前缀缓存 0.82x、短 prompt
@@ -146,6 +148,8 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 | M6 单步成本上限 | `max_prefill_tokens` 不限 / 64 / 16 → 单步峰值 157 / 64 / **16** token（总前向 30 / 32 / 39） | `benchmark/verify_m6.py` |
 | ⚠️ 同一负载的墙钟 | M2.5 **306ms** → Step4 670ms → M6 624ms → **M6+Triton 301ms**（重复 3 次取最短） | `benchmark/verify_m6.py` / `verify_m5.py` |
 | M5 Triton 端到端 | PyTorch 分页 **565 → 301 ms（1.88x）**；输出与调度统计完全一致 | `benchmark/verify_m5.py` |
+| M7 CUDA Graph（三路对照） | decode 步：A 逐行 hook / B eager+向量化 / C 图。B=8：**22.4 → 4.2 ms（5.3x）**；B=1：10.1 → 3.3 ms | `benchmark/verify_m7.py` |
+| M7 变量拆分 | 向量化写入 B/A = 0.78x(B=1) → **0.38x(B=8)**；CUDA Graph C/B 稳定在 **0.41–0.50** | `benchmark/verify_m7.py` |
 | M5 微基准（单层 decode） | seq_len 128–2048、block_size 8/16/32：1.0–2.0x，且**不随 seq_len 单调** | `benchmark/verify_m5.py` |
 
 > ⚠️ gpt2 与 Qwen 的长 prompt 实验**长度不同**（696 / 601）。报告中必须写清，否则被追问会措手不及。
@@ -168,12 +172,13 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 | M6 Chunked Prefill | 10 |
 | M5 Triton kernel（对齐参考实现） | 21 |
 | M5 Triton 端到端（换后端，输出与统计不变） | 10 |
-| 合计 | **129（全部通过，无 xfail）** |
+| M7 CUDA Graph（含 padding 不污染真实序列的回归测试） | 9 |
+| 合计 | **138（全部通过，无 xfail）** |
 
 ## 5. 投递前 Checklist
 
 ### 代码 / 仓库
-- [x] `pytest tests/` 全绿（129 passed，无 xfail）
+- [x] `pytest tests/` 全绿（138 passed，无 xfail）
 - [x] M1/M3 两处边界 bug 已修 + 回归测试已补
 - [x] README 数字与 `benchmark/results/` 一致（696 / 601 已核对）
 - [x] `docs/official-vs-mine.md` 已就位（用于回答"与官方差距"）
