@@ -312,14 +312,44 @@ chunked-prefill   triton   cuda   pytorch   from-scratch   inference-engine
 SGEMM 算子优化（CUDA C++）                                2026.09 – 至今
 个人项目 | 严格 FP32 | RTX 4070 Laptop（sm_89）
 
-· 统一验证框架：自建 harness（CPU 参考验语义 + cuBLAS 对照测性能 + ncu 采证），
-  每版本输出 CSV，数据可复现。
-· 优化阶梯：naive → shared memory 分块 → 2D 寄存器分块（BM×BN×BK=128×128×8、
-  TM×TN=8×8、每线程 64 累加器），N=4096 下 1.11 → 8.95 TFLOPS（8.0x），
-  达同精度 cuBLAS 的 73.4%。
-· 瓶颈定位：用 ncu 证明 naive 版瓶颈在 L1TEX 访存管线（l1tex__throughput 96.5%、
-  DRAM throughput 3.4%），而非 DRAM 带宽或访存延迟，据此确定后续优化方向。
+· 统一基准框架：自建 harness 三件套（CPU 参考验语义 + cuBLAS 对照测性能 + ncu 采证），
+  每版本输出 CSV；先立「没有正确性 PASS 不测速、没有 ncu 数据不算完成」的纪律。
+· v0 naive 基线归因（1.11 TFLOPS，cuBLAS 10.0%）：ncu 实测瓶颈在 L1TEX 访存管线
+  （l1tex__throughput 96.5% / DRAM 3.4% / L1 sector 命中 95%），证明访存模式本身已最优
+  （A 广播 1 sector、B 连续 4 sectors/128B），瓶颈是「访存条数」而非「模式」，
+  据此确定后续优化路线。
+· v3 二维寄存器分块（8.95 TFLOPS，cuBLAS 73.4%）：设计 BM×BN×BK=128×128×8 Block Tile
+  与 TM×TN=8×8 Thread Tile，每线程 64 个累加器常驻寄存器，用外积计算把 smem 读取
+  摊薄 TM×TN 倍，N=4096 下较 naive 加速 8.0×。
 ```
+
+### 写作规则：**一条 bullet = 一个版本**
+
+参考简历的 SGEMM 读起来厉害，**不是因为它更强，而是因为它有 4 条 bullet（4 个版本）**，
+每条都是「技术名 → 解决的问题 → 手段 → 数字 → 相对上一版」。
+
+你现在只有 v0 和 v3 两个数据点 → 只能写 2 条。**每完成一级台阶，就加一条 bullet**：
+v4 float4 / v5 cp.async 双缓冲 / v6 warp tiling → 最终 5–6 条。
+
+> ⚠️ **不要声称做过 v1/v2**（shared memory 分块、1D tiling）——你从 v0 直接跳到 v3 了。
+> 想补齐这两级也很值（`ROADMAP.md` 里已有迁移路线，`cuda_code/course5_1/matmul1~2.cu`
+> 是现成的），一天能补完，立刻多两条 bullet + 两个数据点。
+
+### 面试官视角：58.24x 是虚荣指标
+
+| | 参考简历（4060 Laptop） | 你（4070 Laptop） |
+|---|---|---|
+| naive 起点 | 113.55 GFLOPS | **1112.3 GFLOPS（快 9.8 倍）** |
+| 最终 | 6.61 TFLOPS | **8.95 TFLOPS（高 35%）** |
+| 加速比 | 58.24× | 8.0× |
+| vs cuBLAS | 98.52% | 73.4%（你才到 v3） |
+
+**他们 58.24× 里约 10 倍是「起点低」白送的**；你 naive 起点高，是因为你的访存模式
+一开始就正确（ncu 已证）。**所以参考简历那条「访存合并 → 6.52×」在你这里根本不存在
+—— 不是你弱，是你的基线本来就没病。**
+
+真正的差距只有 **cuBLAS 占比（98.52% vs 73.4%）**，根源是**他们走完了 v6，你才到 v3**。
+补完 float4 / 双缓冲 / warp tiling 三级标准台阶，大概率也能上 90%+。
 
 **数据出处**（`sgemm-cuda/bench.csv` + `results/v0_baseline.csv`，N=4096）：
 
