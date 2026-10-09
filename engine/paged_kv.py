@@ -120,6 +120,23 @@ def paged_attention(q: torch.Tensor, k_seq: torch.Tensor, v_seq: torch.Tensor) -
     return torch.einsum("ht,thd->hd", w, v_seq)                # [H, D]
 
 
+def paged_attention_gqa(q: torch.Tensor, k_seq: torch.Tensor, v_seq: torch.Tensor,
+                        group: int = 1) -> torch.Tensor:
+    """GQA / MQA 版的 paged_attention。
+
+    GQA（Grouped-Query Attention）下 Q 的头数 Hq 是 K/V 头数 Hkv 的整数倍，
+    **第 h 个 query 头用第 h // group 个 KV 头**（group = Hq / Hkv）。
+    LLaMA / Qwen 系列全是这样；GPT-2 是 group=1（每个 Q 头各有一套 K/V）。
+
+    Args:
+        q: [Hq, D]；k_seq / v_seq: [T, Hkv, D]
+    """
+    if group == 1:
+        return paged_attention(q, k_seq, v_seq)
+    idx = torch.arange(q.shape[0], device=q.device) // group     # [Hq] 每个 Q 头对应的 KV 头
+    return paged_attention(q, k_seq[:, idx, :], v_seq[:, idx, :])
+
+
 # ─────────────────── M4b：把分页池接进自研前向 ───────────────────
 
 def allocate_for(pool: PagedKVPool, seq_len: int) -> list:
@@ -184,8 +201,9 @@ class PagedAttentionHook:
         k_seq, v_seq = self.pool.gather_layer(layer_idx, self.block_table, total)
 
         # ③ 逐 query 算注意力：query 的绝对位置是 base+i，只能看 key 的 0..base+i
-        outs = [paged_attention(q[0, :, i, :],
-                                k_seq[: base + i + 1], v_seq[: base + i + 1])
+        group = q.shape[1] // k.shape[1]        # GQA：Hq / Hkv（GPT-2 为 1）
+        outs = [paged_attention_gqa(q[0, :, i, :],
+                                    k_seq[: base + i + 1], v_seq[: base + i + 1], group)
                 for i in range(S)]
         return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S, Dh]
 
@@ -289,13 +307,14 @@ class BatchedPagedAttentionHook:
 
         # ② 逐序列 gather，再逐 query 算注意力
         #    （query 的绝对位置 base+t 只能看到 key 的 0..base+t —— 因果性）
+        group = q.shape[1] // k.shape[1]          # GQA：Hq / Hkv（GPT-2 为 1）
         outs = []
         for s in range(self.n_seq):
             b, n, tbl = self.base[s], self.new_lens[s], self.block_tables[s]
             k_seq, v_seq = self.pool.gather_layer(layer_idx, tbl, b + n)
             for t in range(n):
-                outs.append(paged_attention(q[0, :, self.cu[s] + t, :],
-                                            k_seq[: b + t + 1],
-                                            v_seq[: b + t + 1]))
+                outs.append(paged_attention_gqa(q[0, :, self.cu[s] + t, :],
+                                                k_seq[: b + t + 1],
+                                                v_seq[: b + t + 1], group))
         # 拍平顺序 = 序列顺序 × 序列内顺序，与输入对齐
         return torch.stack(outs, dim=1).unsqueeze(0)       # [1, H, S_total, Dh]

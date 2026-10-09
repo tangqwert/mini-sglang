@@ -30,13 +30,15 @@ def paged_continuous_generate(
     pool: PagedKVPool,
     max_batch_size: int = 4,
     hook_cls=None,
+    forward_fn=None,
 ) -> tuple[list[torch.LongTensor], SchedulerStats]:
     """分页版连续准入解码（准入策略同 M2.5，KV 管理换成页表 + varlen 前向）。
 
     Args:
         hook_cls: 注意力实现（默认纯 PyTorch 的 BatchedPagedAttentionHook）。
             M5 可换成 `TritonPagedAttentionHook` —— 调度器不需要知道区别，
-            这就是“循环只认识可调用对象”的又一次兑现。
+            这就是“循环只认识可调用对象”的又一次兼现。
+        forward_fn: 模型前向（默认 `gpt2_forward`）。换架构时传 `qwen3_forward`。
 
     与 `continuous_generate` 的关键差异：
       · 每条序列有自己的长度，**从不左填充** → `stats.padded_positions == 0`
@@ -57,6 +59,7 @@ def paged_continuous_generate(
     if not requests:
         return [], stats
     hook_cls = hook_cls or BatchedPagedAttentionHook
+    forward_fn = forward_fn or gpt2_forward
 
     B = min(max_batch_size, len(requests))
     device = requests[0].prompt.device
@@ -96,9 +99,9 @@ def paged_continuous_generate(
 
         hook = hook_cls(
             pool, [tables[i] for i, _ in pairs], [0] * len(pairs), lens)
-        logits = gpt2_forward(torch.cat(flat).unsqueeze(0), weights,
-                              attention_fn=hook,
-                              position_ids=torch.cat(pos).unsqueeze(0))
+        logits = forward_fn(torch.cat(flat).unsqueeze(0), weights,
+                           attention_fn=hook,
+                           position_ids=torch.cat(pos).unsqueeze(0))
 
         ends = torch.tensor(lens).cumsum(0) - 1        # 各序列最后一个位置的拍平下标
         for j, (i, r) in enumerate(pairs):
@@ -136,9 +139,9 @@ def paged_continuous_generate(
         hook = hook_cls(
             pool, [tables[i] for i in active], [length[i] for i in active],
             [1] * len(active))
-        logits = gpt2_forward(torch.tensor([feed], device=device), weights,
-                              attention_fn=hook,
-                              position_ids=torch.tensor([pos], device=device))
+        logits = forward_fn(torch.tensor([feed], device=device), weights,
+                           attention_fn=hook,
+                           position_ids=torch.tensor([pos], device=device))
         for j, i in enumerate(active):
             last[i] = int(logits[0, j].argmax())
             length[i] += 1                             # 这一步的 K/V 已进池
@@ -164,8 +167,16 @@ def chunked_prefill_generate(
     max_batch_size: int = 4,
     max_prefill_tokens: int = 512,
     hook_cls=None,
+    use_graph: bool = False,
+    forward_fn=None,
 ) -> tuple[list[torch.LongTensor], SchedulerStats]:
     """M6：Chunked Prefill —— 把 prefill 塞进 decode 的同一次前向。
+
+    Args:
+        use_graph: M7.5 —— 纯 decode 步改走 CUDA Graph（见 `engine/graph_decode.py`）。
+            只有【本步没有任何 prefill 工作】时才走图，因为图的形状必须固定；
+            含 prefill 的步（尤其是分块的）形状是变的，仍走 eager。
+            `stats.graph_steps` 记录了多少步真的走了图。
 
     ── 要解决的最后一个痛点 ──
     M4b Step 4 把"补入时的填充计算"去掉了（喂入 token 降为 1/6.6），但**前向次数
@@ -202,6 +213,7 @@ def chunked_prefill_generate(
     if not requests:
         return [], stats
     hook_cls = hook_cls or BatchedPagedAttentionHook
+    forward_fn = forward_fn or gpt2_forward
 
     B = min(max_batch_size, len(requests))
     device = requests[0].prompt.device
@@ -214,6 +226,18 @@ def chunked_prefill_generate(
     last = [0] * B                   # decode 阶段待喂的 token（绝对位置 = length）
     generated: dict[int, list[int]] = {}
     remaining = [0] * B
+
+    # ── M7.5：预捕获若干张 decode 图（按批大小）──
+    graphs = None
+    if use_graph:
+        # 惰性导入：graph_decode 依赖 triton，不该让本模块硬依赖它
+        from engine.graph_decode import PagedDecodeGraphs
+        # 一条序列最长会到 L + max_new（且最后一步的 K/V 不进池）；留一格余量
+        longest = max(r.prompt.numel() + r.max_new_tokens for r in requests)
+        max_blocks = -(-longest // pool.block_size) + 1
+        cap = sorted({s for s in (1, 2, 4, 8) if s <= B} | {B})
+        graphs = PagedDecodeGraphs(weights, pool, batch_sizes=cap,
+                                   max_blocks=max_blocks)
 
     def register(i: int, tok: int) -> None:
         """登记第 i 行刚产出的 token；完成则释放槽位并归还分页显存。"""
@@ -272,24 +296,34 @@ def chunked_prefill_generate(
         stats.mixed_steps += 1 if n_pre and n_pre < len(kinds) else 0
 
         # ── 一次前向同时服务 prefill 与 decode ──
-        hook = hook_cls(
-            pool, [tables[i] for i in owners], bases, sizes)
-        logits = gpt2_forward(torch.cat(flat).unsqueeze(0), weights,
-                              attention_fn=hook,
-                              position_ids=torch.cat(pos).unsqueeze(0))
+        # M7.5：纯 decode 步走 CUDA Graph（形状固定）；含 prefill 的步仍走 eager
+        # （分块的 prefill 形状是变的，图的静态形状装不下）。
+        if use_graph and n_pre == 0:
+            ids_t = torch.tensor([last[i] for i in owners], device=device)
+            pos_t = torch.tensor(bases, device=device)
+            produced = graphs.step(ids_t, pos_t,
+                                   [tables[i] for i in owners], bases)
+            stats.graph_steps += 1
+        else:
+            hook = hook_cls(
+                pool, [tables[i] for i in owners], bases, sizes)
+            logits = forward_fn(torch.cat(flat).unsqueeze(0), weights,
+                               attention_fn=hook,
+                               position_ids=torch.cat(pos).unsqueeze(0))
+            ends = torch.tensor(sizes).cumsum(0) - 1   # 各序列在拍平维度的末位
+            produced = [int(logits[0, ends[j]].argmax()) for j in range(len(owners))]
 
-        ends = torch.tensor(sizes).cumsum(0) - 1       # 各序列在拍平维度的末位
         for j, i in enumerate(owners):
             length[i] += sizes[j]                      # 本步的 K/V 已进池
             if kinds[j] == "prefill":
                 if length[i] == slot[i].prompt.numel():
                     # 最后一块喂完 → 本步末位 logits 就是第一个生成 token，转入 decode
                     phase[i] = "decode"
-                    last[i] = int(logits[0, ends[j]].argmax())
+                    last[i] = produced[j]
                     register(i, last[i])
                 # 还没喂完的块：不产出 token，继续 prefill
             else:
-                last[i] = int(logits[0, ends[j]].argmax())
+                last[i] = produced[j]
                 register(i, last[i])
 
         stats.steps += 1

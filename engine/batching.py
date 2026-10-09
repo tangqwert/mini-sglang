@@ -229,6 +229,8 @@ class SchedulerStats:
                             M2.5/Step4 恒为 0（两者各开各的前向）。
         prefill_chunks:     （M6）prefill 被切成的段数；> admissions 即发生过跨步分块。
         prefill_tokens:     （M6）prefill 处理掉的 token 总数（可用来对照填充浪费）。
+        graph_steps:        （M7.5）走 CUDA Graph 的步数 —— 只有【纯 decode 步】才会走图，
+                            所以它 ≤ steps - prefill_steps。
     """
     steps: int = 0
     admissions: int = 0
@@ -239,6 +241,7 @@ class SchedulerStats:
     mixed_steps: int = 0
     prefill_chunks: int = 0
     prefill_tokens: int = 0
+    graph_steps: int = 0
 
 
 def continuous_generate(

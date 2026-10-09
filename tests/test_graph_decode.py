@@ -13,10 +13,12 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from engine.batching import Request
 from engine.graph_decode import PagedDecodeGraphs, graph_decode
 from engine.model_forward import gpt2_forward, load_gpt2_weights
 from engine.naive_decode import DecodingConfig, autoregressive_generate
 from engine.paged_kv import PagedKVPool, ensure_blocks
+from engine.paged_schedule import chunked_prefill_generate
 
 triton_paged = pytest.importorskip("engine.triton_paged")
 if not triton_paged.HAS_TRITON:                       # pragma: no cover
@@ -138,3 +140,70 @@ class TestGraphDecode:
         before = len(pool.free_blocks)
         PagedDecodeGraphs(weights, pool, batch_sizes=(1,), max_blocks=8)
         assert len(pool.free_blocks) == before - 1
+
+
+M7_TEXTS = ["The meaning of life is", "Hello world, this is a test",
+            "I love", "Once upon a time"]
+M7_BUDGETS = [3, 5, 2, 4]
+
+
+@requires_cuda
+class TestSchedulerWithGraph:
+    """M7.5：把图接进 `chunked_prefill_generate` 后，调度结果不许变。"""
+
+    def _reqs(self, tok):
+        return [Request(req_id=i, prompt=tok(t, return_tensors="pt").input_ids.cuda(),
+                        max_new_tokens=b)
+                for i, (t, b) in enumerate(zip(M7_TEXTS, M7_BUDGETS))]
+
+    def _run(self, gpu, use_graph):
+        model, tok, weights = gpu
+        reqs = self._reqs(tok)
+        outs, stats = chunked_prefill_generate(weights, reqs, make_pool(model.config),
+                                              max_batch_size=2, use_graph=use_graph)
+        return reqs, outs, stats
+
+    def test_matches_eager_scheduler(self, gpu):
+        """★ 图只改"怎么发 kernel"，不该改任何调度决策或输出。"""
+        _, out_e, st_e = self._run(gpu, False)
+        _, out_g, st_g = self._run(gpu, True)
+
+        for a, b in zip(out_e, out_g):
+            assert torch.equal(a, b), (a.tolist(), b.tolist())
+        assert st_e.graph_steps == 0
+        # 除了 graph_steps，其余统计量必须逐项相等
+        for field in ("steps", "admissions", "admission_forwards", "prefill_steps",
+                      "mixed_steps", "prefill_chunks", "prefill_tokens",
+                      "padded_positions", "idle_slot_steps"):
+            assert getattr(st_e, field) == getattr(st_g, field), field
+
+    def test_graph_only_covers_decode_steps(self, gpu):
+        """只有纯 decode 步能走图 —— 含 prefill 的步形状是变的。"""
+        _, _, st = self._run(gpu, True)
+        assert st.graph_steps > 0, "本负载应该有纯 decode 步"
+        assert st.graph_steps == st.steps - st.prefill_steps, (
+            st.graph_steps, st.steps, st.prefill_steps)
+
+    def test_still_matches_naive_decode(self, gpu):
+        """加了图之后，最终契约（与 M0 朴素解码逐 token 一致）仍成立。"""
+        reqs, outs, _ = self._run(gpu, True)
+        for r, got in zip(reqs, outs):
+            want = autoregressive_generate(
+                lambda ids: gpt2_forward(ids, gpu[2]), r.prompt,
+                DecodingConfig(max_new_tokens=r.max_new_tokens))
+            assert torch.equal(got, want), (got.tolist(), want.tolist())
+
+    def test_batch_size_one_and_three(self, gpu):
+        """批大小 1 与 3：后者不在 {1,2,4} 里，会走 4 档的图（多一行 padding）。"""
+        model, tok, weights = gpu
+        for bs, n in ((1, 1), (3, 3)):
+            reqs = self._reqs(tok)[:n]
+            outs, st = chunked_prefill_generate(
+                weights, reqs, make_pool(model.config), max_batch_size=bs,
+                use_graph=True)
+            assert st.graph_steps > 0
+            for r, got in zip(reqs, outs):
+                want = autoregressive_generate(
+                    lambda ids: gpt2_forward(ids, weights), r.prompt,
+                    DecodingConfig(max_new_tokens=r.max_new_tokens))
+                assert torch.equal(got, want), (bs, got.tolist(), want.tolist())

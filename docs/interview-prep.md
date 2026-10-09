@@ -46,7 +46,7 @@
 
 ---
 
-## 2. 必答 9 题（骨架题，必须闭卷）
+## 2. 必答 10 题（骨架题，必须闭卷）
 
 ### Q1. 走一遍完整流程：从 prompt 到第一个 token
 
@@ -223,6 +223,34 @@ Triton 版每层只剩 **2 个**（1 写 + 1 算），中间量留在寄存器�
 → 能。图捕获的是**指针与 kernel 序列**，页表是缓冲区**内容**；
 重算 / 重新分配块只改变缓冲区里的值，不重建图（真 vLLM 也是这么做的）。
 
+### Q10. 你的引擎能跑真模型吗？GPT-2 和 Qwen3 差在哪？
+
+**能。** `engine/qwen3_forward.py`，与 HF 输出逐元素一致（max|diff| ~2e-5），
+且**接入完整引擎**（分页 + Chunked Prefill + 两个注意力后端）后仍与朴素解码逐 token 一致。
+
+**GPT-2 → Qwen3 正好覆盖了 2023 年后所有主流 LLM 的全部区别**（背下来）：
+
+| 组件 | GPT-2 | Qwen3（LLaMA 系） |
+|---|---|---|
+| 归一化 | LayerNorm | **RMSNorm**（不减均值、无 bias） |
+| 位置编码 | 学到的 `wpe` | **RoPE**（旋转，只作用在 q/k 上） |
+| 注意力头 | MHA（Hq == Hkv） | **GQA**（16 q-heads / 8 kv-heads） |
+| MLP | `c_fc→GELU→c_proj` | **SwiGLU**（gate/up/down，silu） |
+| 额外 | — | **QK-Norm**（对 q/k 各加一层 RMSNorm，**在 RoPE 之前**） |
+| 线性层 bias | 有 | **无** |
+
+**GQA 在引擎里的三个坑**（都是真的踩过）：
+1. **KV 池要按 `n_kv_heads` 开**（不是 q 头数）——否则显存白翻一倍
+2. Triton kernel 里 `kv_head = q_head // group`（grid 仍然按 q 头数）×
+3. 钩子不能假设 `q.shape[1] == k.shape[1]`
+
+**一个隐蔽的 dtype 坑**：HF 会把 **norm 权重留在 fp32**（即使模型是 bf16），
+不对齐的话 q/k 被提升成 fp32 而 v 还是 bf16 → `@` 直接报 dtype 错。
+
+**追问陷阱**：「为什么 head_dim 不等于 hidden / n_head？」
+→ Qwen3-0.6B 是 hidden=1024、16 头、**head_dim=128**，所以 q_proj 输出 2048 维。
+很多实现默认 `D // H`，在 Qwen3 上会直接错——必须读 config 里的 `head_dim`。
+
 ---
 
 ## 3. 四个王牌故事（面试官最容易记住的部分）
@@ -344,8 +372,8 @@ kernel 编译的冷启动开销**全部落在它头上**。
 | **37 → 30** | M6 总前向次数；补入独立前向 **7 → 0** | `benchmark/verify_m6.py` |
 | **565 → 301 ms（1.88x）** | M5 Triton kernel 端到端 | `benchmark/verify_m5.py` |
 | **22.4 → 4.2 ms（5.3x）** | M7 CUDA Graph：decode 步 @ B=8（B=1 时 10.1 → 3.3 ms） | `benchmark/verify_m7.py` |
-| **138** | 测试数（86 假模型/纯张量 + 52 真模型） | `pytest tests/ --collect-only` |
-| **2029** | `engine/` 行数 | `wc -l engine/*.py` |
+| **150** | 测试数（90 假模型/纯张量 + 60 真模型） | `pytest tests/ --collect-only` |
+| **2352** | `engine/` 行数 | `wc -l engine/*.py` |
 
 **成本模型（必须背）**：
 ```
@@ -372,6 +400,7 @@ kernel 编译的冷启动开销**全部落在它头上**。
 - [ ] 读 `engine/paged_schedule.py:160`（`chunked_prefill_generate`）—— 混合批怎么组
 - [ ] 读 `engine/graph_decode.py`（239 行）—— 重点 `_GraphPagedHook` 与 `DecodeGraph.load`
       （全部改动都是为了"可捕获"：地址固定、无 `as_tensor`、一次向量化写入）
+- [ ] 读 `engine/qwen3_forward.py`（~200 行）—— 对比 `model_forward.py` 看那五个组件差异
 - [ ] **跑一遍** `python -m benchmark.verify_m7`，看懂三路对照表里 B/A 与 C/B 两列
 - [ ] **跑一遍** `python -m benchmark.verify_m5`，对着输出讲一遍每个数字
 
@@ -392,9 +421,9 @@ kernel 编译的冷启动开销**全部落在它头上**。
 
 ---
 
-## 7. 35 道自测题（遮住答案自问自答）
+## 7. 38 道自测题（遮住答案自问自答）
 
-> 概念层 6 · 实现层 10 · **why 层 12**（最容易翻车）· 设计层 7
+> 概念层 6 · 实现层 10 · **why 层 15**（最容易翻车）· 设计层 7
 
 **概念层**
 1. 为什么 decode 是 memory-bound？
@@ -429,17 +458,20 @@ kernel 编译的冷启动开销**全部落在它头上**。
 26. CUDAGraph 要求什么约束？为什么分页能同时满足它们？
 27. 图上解码时，一批里多出来的 padding 行为什么不能随便指一个页表？
 28. 图路径在 B=1 和 B=8 的收益分别是多少？为什么 B 没影响图的那部分开销？
+29. GPT-2 和 Qwen3 的前向差哪五个组件？
+30. GQA 下 KV 池要按 q 头数还是 kv 头数开？为什么？
+31. Triton kernel 里怎么把一个 query head 映射到它对应的 KV head？
 
 **设计层**
-29. 为什么解码循环要和模型解耦？举一个它带来好处的具体例子。
-30. 为什么非要把 `attention_fn` 做成可注入的钩子？
-31. 为什么测试要用"上下文依赖的假模型"？
-32. 你怎么保证优化后输出不变？"逐 token 一致"和"误差 < 1e-5"哪个更强？
-33. 你的 Radix 缓存不做节点分裂，代价是什么？
-34. 池子耗尽时你的实现怎么处理？真引擎呢？
-35. 如果给你 4096-token 的 prompt 和 8GB 显存，你的实现会先在哪崩？
+32. 为什么解码循环要和模型解耦？举一个它带来好处的具体例子。
+33. 为什么非要把 `attention_fn` 做成可注入的钩子？
+34. 为什么测试要用"上下文依赖的假模型"？
+35. 你怎么保证优化后输出不变？"逐 token 一致"和"误差 < 1e-5"哪个更强？
+36. 你的 Radix 缓存不做节点分裂，代价是什么？
+37. 池子耗尽时你的实现怎么处理？真引擎呢？
+38. 如果给你 4096-token 的 prompt 和 8GB 显存，你的实现会先在哪崩？
 
-> 35 题答案都在代码与本次对话里。**答不上来的写在一张纸上**，那是你 D4 的复习清单。
+> 38 题答案都在代码与本次对话里。**答不上来的写在一张纸上**，那是你 D4 的复习清单。
 
 ---
 

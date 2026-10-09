@@ -51,10 +51,12 @@ if HAS_TRITON:
         stride_bt,
         H: tl.constexpr, D: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+        G: tl.constexpr,
     ):
         pid_s = tl.program_id(0)            # 第几条序列
         pid_m = tl.program_id(1)            # 第几个 query 块
-        pid_h = tl.program_id(2)            # 第几个 head
+        pid_h = tl.program_id(2)            # 第几个 query head
+        kh = pid_h // G                     # GQA：这个 query head 用第几个 KV head
 
         cu = tl.load(CuQ + pid_s)                       # 该序列在拍平维度的起点
         n_q = tl.load(CuQ + pid_s + 1) - cu             # 本次要算几个 query
@@ -86,10 +88,10 @@ if HAS_TRITON:
                           mask=n_ok, other=0)
             slot = n_idx % BLOCK_SIZE
             k = tl.load(K + blk[:, None] * stride_kb + slot[:, None] * stride_ks
-                          + pid_h * stride_kh + offs_d[None, :],
+                          + kh * stride_kh + offs_d[None, :],
                         mask=n_ok[:, None], other=0.0)
             v = tl.load(V + blk[:, None] * stride_kb + slot[:, None] * stride_ks
-                          + pid_h * stride_kh + offs_d[None, :],
+                          + kh * stride_kh + offs_d[None, :],
                         mask=n_ok[:, None], other=0.0)
 
             # ② 打分（严格 fp32，不开 TF32 —— 我们要与参考实现逐元素对齐）
@@ -112,80 +114,123 @@ if HAS_TRITON:
 
 
 class TritonPagedAttentionHook:
-    """与 `BatchedPagedAttentionHook` 同接口、同数学，但每层只启动 2 个 kernel。
+    """与 `PagedAttentionHook` / `BatchedPagedAttentionHook` **同接口**、同数学，
+    但每层只启动 2 个 kernel（1 写 + 1 算）。
 
-    用法与多序列钩子完全一致（`gpt2_forward(..., attention_fn=hook)`），
-    所以可以当作 step 4 / M6 调度器的可替换零件注进去。
+    **两种用法** —— 这是它"可注入"的关键：
+
+    1. **单序列（与 `PagedAttentionHook` 完全互换）**：只传池子和页表，
+       钩子自己维护"已写到哪"（`layer_idx == 0` 时推进一次）::
+
+           hook = TritonPagedAttentionHook(pool, block_table)
+           logits = gpt2_forward(prompt, weights, attention_fn=hook)     # prefill
+           logits = gpt2_forward(tok, weights, attention_fn=hook,
+                                 position_ids=torch.tensor([[T]]))      # decode
+
+    2. **多序列 / 显式控制（与 `BatchedPagedAttentionHook` 互换）**：
+       传 `bases` + `new_lens`，复用同一钩子做 varlen 批次。
 
     Args:
-        pool, block_tables, bases, new_lens: 同 BatchedPagedAttentionHook。
-        BLOCK_M: query 方向分块（decode 时 n_q=1，只有首行有效）。
-        BLOCK_N: KV 方向分块（online softmax 的步长）。
+        bases / new_lens: 不传即进入单序列自动模式（只支持 1 条序列）。
+        block_m / block_n: query / KV 方向的分块大小。
     """
 
     def __init__(self, pool: PagedKVPool, block_tables: list,
-                 bases: list, new_lens: list,
+                 bases: list | None = None, new_lens: list | None = None,
                  block_m: int = 16, block_n: int = 64):
         assert HAS_TRITON, "未安装 triton，无法使用 TritonPagedAttentionHook"
         self.pool = pool
-        self.block_tables = list(block_tables)
-        self.base = list(bases)
-        self.new_lens = list(new_lens)
-        self.n_seq = len(self.new_lens)
-        assert len(self.block_tables) == self.n_seq == len(self.base)
+        self.auto = bases is None and new_lens is None
+        if self.auto:
+            # ⚠️ 单序列模式下第二个参数是【一条序列的页表】(list[int]) —— 与
+            # `PagedAttentionHook` 的口径一致；这里包一层，统一成"每序列一张表"。
+            # 显式模式下则是【每序列一张表】的列表。
+            self.block_tables = [list(block_tables)]
+            self.n_seq = 1
+            self.written = [0]
+            self.base, self.new_lens = [0], [0]
+        else:
+            self.block_tables = [list(t) for t in block_tables]
+            self.n_seq = len(self.block_tables)
+            self.base, self.new_lens = list(bases), list(new_lens)
+            assert len(self.block_tables) == self.n_seq == len(self.base)
+            self.written = [b + n for b, n in zip(self.base, self.new_lens)]
         assert pool.head_dim >= 16, \
             f"head_dim={pool.head_dim} 太小：tl.dot 要求 K 维至少 16"
         self.block_m, self.block_n = block_m, block_n
 
         dev = pool.keys.device
-        # 这些元数据在一次 forward 内不变，构造时整理好，避免每层重复搭建
-        self.cu = [0]
-        for n in self.new_lens:
-            self.cu.append(self.cu[-1] + n)
-        self.cu_t = torch.tensor(self.cu, dtype=torch.int32, device=dev)
-        self.base_t = torch.tensor(self.base, dtype=torch.int32, device=dev)
-        self.totalk_t = torch.tensor(
-            [b + n for b, n in zip(self.base, self.new_lens)],
-            dtype=torch.int32, device=dev)
-        width = max(len(t) for t in self.block_tables)
-        bt = torch.zeros(self.n_seq, width, dtype=torch.int32, device=dev)
-        for i, t in enumerate(self.block_tables):
-            bt[i, :len(t)] = torch.as_tensor(t, dtype=torch.int32, device=dev)
-        self.bt_t = bt
+        # 长整型页表：scatter_kv 要用它做高级索引。页表在一次 forward 内不变，
+        # 构造时转一次即可（早期版本每层每序列都转，是纯浪费）。
+        self.bt_long = [torch.as_tensor(t, dtype=torch.long, device=dev)
+                        for t in self.block_tables]
         self.kv_writes = 0
+        self._bases = self._lens = None
+
+    @staticmethod
+    def _metadata(pool, block_tables, bases, lens):
+        """把本次 forward 的元数据打包成设备张量（cu_seqlens / base / total_k / 页表）。"""
+        dev = pool.keys.device
+        cu = [0]
+        for n in lens:
+            cu.append(cu[-1] + n)
+        width = max(len(t) for t in block_tables)
+        bt = torch.zeros(len(block_tables), width, dtype=torch.int32, device=dev)
+        for i, t in enumerate(block_tables):
+            bt[i, :len(t)] = torch.as_tensor(t, dtype=torch.int32, device=dev)
+        return (torch.tensor(cu, dtype=torch.int32, device=dev),
+                torch.tensor(bases, dtype=torch.int32, device=dev),
+                torch.tensor([b + n for b, n in zip(bases, lens)],
+                             dtype=torch.int32, device=dev), bt)
 
     def __call__(self, q, k, v, layer_idx: int):
-        B, H, S_total, Dh = k.shape
-        assert B == 1 and S_total == self.cu[-1], \
-            f"拍平长度对不上：前向给了 {S_total}，钩子声明 {self.cu[-1]}"
+        B, Hkv, S_total, Dh = k.shape
+        assert B == 1, "本钩子只处理拍平成 [1, S] 的批次"
+        Hq = q.shape[1]
+        G = Hq // Hkv                     # GQA：Hq / Hkv（GPT-2 为 1）
 
-        # ① 写（向量化 scatter，每个序列一个 index_put_ kernel）
+        # 元数据在 layer 0 算一次，之后各层复用（各层形状一定相同）
+        if layer_idx == 0:
+            if self.auto:
+                self._bases = list(self.written)
+                self._lens = [S_total]
+                self.written = [b + S_total for b in self._bases]
+            else:
+                self._bases, self._lens = self.base, self.new_lens
+            assert S_total == sum(self._lens), \
+                f"拍平长度对不上：前向给了 {S_total}，钩子声明 {self._lens}"
+            (self._cu_t, self._base_t,
+             self._totalk_t, self._bt_t) = self._metadata(
+                self.pool, self.block_tables, self._bases, self._lens)
+        bases, lens = self._bases, self._lens
+
+        # ① 写（向量化 scatter，每个序列一次 index_put_）
+        cu = 0
         for s in range(self.n_seq):
-            b, n = self.base[s], self.new_lens[s]
-            a = self.cu[s]
-            scatter_kv(self.pool, layer_idx, torch.as_tensor(
-                self.block_tables[s], dtype=torch.long, device=k.device), b,
-                k[0, :, a:a + n, :].transpose(0, 1),
-                v[0, :, a:a + n, :].transpose(0, 1))
+            n = lens[s]
+            scatter_kv(self.pool, layer_idx, self.bt_long[s], bases[s],
+                       k[0, :, cu:cu + n, :].transpose(0, 1),
+                       v[0, :, cu:cu + n, :].transpose(0, 1))
             self.kv_writes += n
+            cu += n
 
         # ② 一次 kernel 算完全部序列 × 全部 query × 全部 head
         out = torch.empty_like(q)
-        keys = self.pool.keys[layer_idx]          # [NB, BS, H, D]
+        keys = self.pool.keys[layer_idx]          # [NB, BS, Hkv, D]
         vals = self.pool.values[layer_idx]
-        qv, ov = q[0], out[0]                     # [H, S_total, D]
-        max_q = max(self.new_lens)
-        grid = (self.n_seq, triton.cdiv(max_q, self.block_m), H)
+        qv, ov = q[0], out[0]                     # [Hq, S_total, D]
+        grid = (self.n_seq, triton.cdiv(max(lens), self.block_m), Hq)
         _paged_attn_kernel[grid](
             qv, keys, vals, ov,
-            self.bt_t, self.cu_t, self.base_t, self.totalk_t,
+            self._bt_t, self._cu_t, self._base_t, self._totalk_t,
             Dh ** -0.5,
             qv.stride(0), qv.stride(1),
             keys.stride(0), keys.stride(1), keys.stride(2),
             ov.stride(0), ov.stride(1),
-            self.bt_t.stride(0),
-            H=H, D=Dh,
+            self._bt_t.stride(0),
+            H=Hq, D=Dh,
             BLOCK_M=self.block_m, BLOCK_N=self.block_n,
             BLOCK_SIZE=self.pool.block_size,
+            G=G,
         )
         return out

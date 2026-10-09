@@ -56,6 +56,8 @@ class _GraphPagedHook:
         B, H, S, Dh = k.shape
         assert B == 1 and S == self.n_seq, \
             f"decode 图要求拍平成 [1, {self.n_seq}]，收到 [{B}, {S}]"
+        Hq = q.shape[1]
+        G = Hq // H                       # GQA：Hq / Hkv（GPT-2 为 1）
         bs = self.pool.block_size
 
         # ① 写：B 个 token 一次性 scatter（绝对位置 → 块 + 槽位）
@@ -69,7 +71,7 @@ class _GraphPagedHook:
         keys = self.pool.keys[layer_idx]
         vals = self.pool.values[layer_idx]
         qv, ov = q[0], out[0]
-        _paged_attn_kernel[(self.n_seq, 1, H)](
+        _paged_attn_kernel[(self.n_seq, 1, Hq)](
             qv, keys, vals, ov,
             self.bt_t, self.cu_t, self.base_t, self.totalk_t,
             Dh ** -0.5,
@@ -77,9 +79,10 @@ class _GraphPagedHook:
             keys.stride(0), keys.stride(1), keys.stride(2),
             ov.stride(0), ov.stride(1),
             self.bt_t.stride(0),
-            H=H, D=Dh,
+            H=Hq, D=Dh,
             BLOCK_M=self.block_m, BLOCK_N=self.block_n,
             BLOCK_SIZE=bs,
+            G=G,
         )
         return out
 

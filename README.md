@@ -5,13 +5,14 @@
 ```
 朴素解码 → KV Cache → Continuous Batching → Radix 前缀缓存 → 分页 KV / PagedAttention
         → 零填充 varlen 调度 → Chunked Prefill → 自研 GPT-2 前向 → 自研 Triton 分页注意力 kernel
+        → CUDA Graph 整步捕获 → Qwen3 架构支持（GQA / RoPE / RMSNorm / SwiGLU）
 ```
 
 不是为了调用推理框架，而是为了回答一个问题：**vLLM/SGLang 到底在优化什么，为什么，以及优化在什么场景下不划算。**
 
-- 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / Qwen2.5-0.5B ｜ Python / PyTorch / Triton
-- **138 项测试全部通过**，每条优化路径都与朴素实现做**逐 token 一致性**验证
-- **8 组带数字的对照实验**（含 3 个诚实的负结果/反常现象）+ 1 个自研 Triton kernel + 自研 CUDA Graph 解码
+- 硬件：RTX 4070 Laptop (8GB) ｜ 模型：GPT-2 124M / **Qwen3-0.6B（GQA）** / Qwen2.5-0.5B ｜ Python / PyTorch / Triton
+- **150 项测试全部通过**，每条优化路径都与朴素实现做**逐 token 一致性**验证
+- **8 组带数字的对照实验**（含 3 个诚实的负结果/反常现象）+ 自研 Triton kernel + 自研 CUDA Graph 解码 + **架构无关前向**
 
 > ⚠️ **与官方同名项目的区分**：本仓库是**教学向**实现，与 SGLang 官方的
 > [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang)（生产级精简框架，~5000 行 + CUDA kernel，H200 级 benchmark）**无代码或血缘关系**。
@@ -62,6 +63,7 @@ decode throughput  : 163.5 tokens/s
 ├──────────────────────────────────────────────┤
 │ engine/paged_schedule.py  分页/合流调度      │  页表 + varlen（M4b/M6）
 │ engine/graph_decode.py     CUDA Graph 解码   │  整步折成 1 次 launch（M7）
+│ engine/qwen3_forward.py    Qwen3 架构前向    │  GQA/RoPE/RMSNorm（M8）
 │ engine/model_forward.py   自研 GPT-2 前向    │  接管 attention（M4b）
 │ engine/paged_kv.py       分页 KV 池 + 注意力 │  按页表 gather（M4a）
 │ engine/triton_paged.py    分页注意力 kernel  │  Triton（M5）
@@ -177,7 +179,7 @@ M4b/M6 之后同一负载 **M2.5 306ms → Step4 670ms → M6 624ms**：喂入 t
 
 TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的假模型**——它让"丢缓存"类 bug 无法蒙混过关），`engine/` 中的实现逐里程碑完成；每个里程碑在 `benchmark/results/` 留档数据。
 
-测试金字塔：86 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 52 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比、「Triton kernel vs PyTorch 参考」逐元素对比）。
+测试金字塔：90 项假模型 / 纯张量单元测试（毫秒级，精确断言内部行为）+ 60 项真模型测试（含「自研前向 vs HF」逐元素对比、「分页增量解码 vs 朴素解码」逐 token 对比、「Triton kernel vs PyTorch 参考」逐元素对比、「Qwen3 走完整引擎 vs 朴素解码」逐 token 对比）。
 
 ## 路线图
 
@@ -193,9 +195,10 @@ TDD / 规格先行：`tests/` 定义行为契约（含一个**上下文依赖的
 - [ ] **M5.5** split-K / flash-decoding（把 KV 维也切开并行，解决"单序列只有 H 个 program、SM 大量空转"）
 - [x] **M6** Chunked Prefill（prefill 与 decode 合流；`max_prefill_tokens` 给单步成本设上限）
 - [x] **M7** CUDA Graph（decode 步 B=8 时 **22.4 → 4.2 ms（5.3x）**；B=1 时 10.1 → 3.3 ms）
-- [ ] **M7.5** 把图路径接进调度器（当前为独立解码工具 + 基准；调度器仍需按 batch size 选图）
-- [ ] **M8** 采样策略（temperature / top_p / top_k）
-- [ ] **M9** 最小 HTTP 服务（`/v1/chat/completions`）
+- [x] **M7.5** 把图路径接进调度器（纯 decode 步走图，`stats.graph_steps` 记账；输出与调度统计不变）
+- [x] **M8** **Qwen3 架构支持**（GQA + RoPE + RMSNorm + SwiGLU + QK-Norm；与 HF 逐元素一致 max|diff| ~2e-5，且接入完整引擎后与朴素解码逐 token 一致）
+- [ ] **M9** 采样策略（temperature / top_p / top_k）
+- [ ] **M10** 最小 HTTP 服务（`/v1/chat/completions`）
 
 > 与 SGLang 官方 [mini-sglang](https://github.com/sgl-project/mini-sglang) 的模块级对照、覆盖度与缺口分析见 [`docs/official-vs-mine.md`](docs/official-vs-mine.md)。
 > **不计划实作**：Tensor Parallelism、Overlap Scheduling、ZMQ 多进程架构 —— 以读懂并讲清原理为目标。

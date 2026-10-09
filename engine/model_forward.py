@@ -98,7 +98,15 @@ def _causal_attention(q, k, v, layer_idx: int | None = None):
 
     `layer_idx` 只是为了与其它 attention_fn 统一签名（分页版靠它定位层），
     连续版用不上。
+
+    GQA：若 K/V 的头数比 Q 少（LLaMA / Qwen 系列），按 `Hq // Hkv` 分组广播
+    （第 h 个 Q 头用第 h // group 个 KV 头）。
     """
+    Hq, Hkv = q.shape[1], k.shape[1]
+    if Hkv != Hq:
+        group = Hq // Hkv
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
     Dh = q.shape[-1]
     scores = q @ k.transpose(-1, -2) / Dh ** 0.5
     Sq, Sk = scores.shape[-2], scores.shape[-1]
@@ -162,8 +170,16 @@ def paged_generate(weights: GPT2Weights,
                    prompt_ids: torch.LongTensor,
                    n_new: int,
                    pool,
-                   block_table: list) -> torch.LongTensor:
+                   block_table: list,
+                   forward_fn=None,
+                   hook_cls=None) -> torch.LongTensor:
     """用自研前向 + 分页 KV 池做贪心解码。
+
+    Args:
+        forward_fn: `(ids, weights, position_ids, attention_fn)` —— 默认 `gpt2_forward`。
+            换架构时传 `qwen3_forward` 即可（本函数与具体模型无关）。
+        hook_cls: 默认 `PagedAttentionHook`（纯 PyTorch）；可换成
+            `TritonPagedAttentionHook`。
 
     结构 = prefill 一步 + decode (n_new - 1) 步：
       prefill：整条 prompt 一次前向（绝对位置 0..T-1），K/V 落进池
@@ -176,19 +192,21 @@ def paged_generate(weights: GPT2Weights,
     Returns:
         LongTensor[1, T + n_new]，prompt + 生成部分（含预 prompt）。
     """
-    hook = PagedAttentionHook(pool, block_table)
+    hook_cls = hook_cls or PagedAttentionHook
+    forward_fn = forward_fn or gpt2_forward
+    hook = hook_cls(pool, block_table)
     device = prompt_ids.device
     out = prompt_ids[0].tolist()
 
     # ── prefill ──
-    logits = gpt2_forward(prompt_ids, weights, attention_fn=hook)
+    logits = forward_fn(prompt_ids, weights, attention_fn=hook)
     nxt = int(logits[0, -1].argmax())
     out.append(nxt)
 
     # ── decode：每步只喂 1 个 token ──
     for _ in range(n_new - 1):
         pos = len(out) - 1                       # 待喂 token 的绝对位置
-        logits = gpt2_forward(
+        logits = forward_fn(
             torch.tensor([[nxt]], device=device), weights, attention_fn=hook,
             position_ids=torch.tensor([[pos]], device=device))
         nxt = int(logits[0, -1].argmax())
