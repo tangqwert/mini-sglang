@@ -254,7 +254,8 @@ chunked-prefill   triton   cuda   pytorch   from-scratch   inference-engine
 
 ## 8. 你现有简历需要改的地方
 
-> 下面几条是在早前沟通里提到的点。把简历原文发我，我可以直接逐句改。
+> **2026-10-09 已核对真实简历**（`E:\Workspace\简历\Ai INFRA.docx`）。
+> 下面的表保留了通用建议；**实测发现的具体问题**见本节末尾的「核对结果」。
 
 | 位置 | 现在是 | 改成 | 为什么 |
 |---|---|---|---|
@@ -264,4 +265,72 @@ chunked-prefill   triton   cuda   pytorch   from-scratch   inference-engine
 | 占位符 | 文中的 `xxx` | 填掉或整条删掉 | 投递版留占位符 = 不认真（§6 第 4 条） |
 | 技能栏（若写了 CUDA） | 「熟悉 CUDA」 | 「CUDA：掌握并行编程模型与 profiling；正在做算子练习」 | 诚实且不露怯；被追问 coalescing / tiling 细节时不会翻车（§6 第 3 条） |
 | 技能栏 | 「熟悉 Triton」（若只列在技能栏） | 「Triton：手写过分页注意力 kernel（online softmax + 页表访存）」 | 写在**项目**栏里、且在技能栏标出具体做到什么程度，比单写一个词可信得多 |
+
+### 8.1 核对结果（2026-10-09，逐条对着原简历）
+
+| # | 位置 | 现在是 | 改成 | 严重度 |
+|---|---|---|---|---|
+| 1 | SGEMM 条目 | 标题下面**完全空白** | 见 **§10**（你已有真实数据） | 🔴 致命 |
+| 2 | 拼写 | `Pytoch` / `Trition` / `decide步` / `增量向前` | `PyTorch` / `Triton` / `decode 步` / `增量前向` | 🔴 |
+| 3 | 箭头 | `29.2 > 6.5ms`（`>` 实为 `→` 的 typo） | 全文 `>` → `→` | 🟡 |
+| 4 | 深度学习栏 | 「熟悉 **xxx** 等主流模型架构」 | 「熟悉 GPT-2 / Qwen2.5 / Qwen3（GQA、RoPE、RMSNorm、SwiGLU、QK-Norm）」 | 🔴 占位符 |
+| 5 | 模型推理框架栏 | 「**熟悉** mini-sglang 的整体结构」 | 「**从零实现** mini-sglang 推理引擎全链路」 | 🔴 |
+| 6 | 技能栏漏 Triton | 只写「熟悉 CUDA 的编写」 | 最大的里程碑就是手写 Triton kernel，必须写 | 🔴 自曝其短 |
+| 7 | 缺 GitHub 链接 | 无 | `github.com/tangqwert/mini-sglang` | 🔴 招聘方必看 |
+| 8 | 「具备算法基础」 | 空话，且经典 DS 本就薄弱 | **删掉** | 🟡 送把柄 |
+| 9 | 缺跨模型数字 | 只有 gpt2 4.51x | 补「Qwen2.5-0.5B / Qwen3-0.6B 复现（1.95x / 2.08x）」 | 🟡 |
+| 10 | 雅思 6.5 | 国内岗无用 | 投外企才留 | ⚪ |
+
+> ⚠️ **绝对不能抄**：参考图（小红书）里 FP8 KV Cache、算子融合 95% 带宽、37% 吞吐 等
+> **都是别人的数据**。你自己仓库里的数字够硬，只是需要翻译成「能力」（见 §9）。
+
+## 9. 我到底能展现什么能力（面试官视角）
+
+> 简历写的是「我做了什么」，面试考的是「我能判断什么」。两者的桥梁是这张表。
+
+| # | 能力 | 你的证据 | 他会怎么问 | 你的答案骨架 |
+|---|---|---|---|---|
+| ① | **从论文到代码的落地力** | 手写 PagedAttention / RadixAttention / online softmax / CUDA Graph / Chunked Prefill | 「PagedAttention 实现到什么程度？和官方差在哪？」 | 讲清你**主动放弃**了什么（不分裂节点、不 refill）及为何仍能验证核心机制 |
+| ② | **性能归因力**（最值钱） | 成本模型「每步 = 权重搬运(固定) + 序列计算(∝长度)」；跨 3 模型梯度；8 次「理论 vs 实测」；3 个负结果 | 「4.51x 为什么不是 12x？」「这优化什么时候**没用**？」 | 地板效应 + 收益 ∝ 被省成分**占比** + Qwen3 反直觉 |
+| ③ | **正确性保证力** | 150 测试；`FakeSeqCache`/`tokens_fed` 计量器；逐 token 全等；Qwen3 vs HF `<5e-5` | 「你怎么知道优化没算错？」 | 三道闸：测试金字塔 → 计量器断言 → 数值对齐 |
+| ④ | **测量纪律**（应届生极稀缺） | 两次抓出自己 benchmark 的系统性偏差（1.18x→3.0x；假的 0.81x） | 「你的数字可信吗？」 | 预热 + best-of-3 + 重置 runner；**主动讲「我原来的数字是错的」** |
+| ⑤ | **架构判断力** | 循环与模型解耦（注入 `logits_fn`/`kv_forward`/`hook_cls`）；M1–M8 零改动循环本体 | 「扩展性怎么设计的？」 | 依赖注入式解耦：换后端 = 换一个可调用对象 |
+| ⑥ | **算子级优化方法论** | SGEMM：1.11 → 8.95 TFLOPS（8.0x），cuBLAS 73.4% | 「瓶颈在哪？下一步往哪优化？」 | ncu 四件套：DRAM 吞吐 / sectors-per-request / bank conflict / long-scoreboard stall |
+| ⑦ | **全栈纵深**（差异化） | Verilog MIPS RTL → CUDA SGEMM → Triton → 调度层 → 测试体系 | 「更偏上层还是底层？」 | 从 RTL 到调度器一条链亲手走过——国产 GPU / 芯片公司最吃 |
+
+### 一句话画像（背下来）
+
+> 「我不是『用过推理框架』的人。我是『从零造过一个，并且能用测量数据说清
+> **它在什么条件下有效、什么条件下无效**』的人。」
+
+大多数应届生答「我做了 X，快了 Y 倍」；你能答「快了 Y 倍，**但只在 Z 条件下**，
+因为成本结构是……」。**第二句才是能力。**
+
+## 10. SGEMM 简历条目（数据已从 `bench.csv` 核对）
+
+```
+SGEMM 算子优化（CUDA C++）                                2026.09 – 至今
+个人项目 | github.com/tangqwert/sgemm-cuda
+
+· 统一验证框架：自建 harness（CPU 参考验语义 + cuBLAS 对照测性能 + ncu 采证），
+  每版本输出 CSV，数据可复现；RTX 4070 Laptop / sm_89 / 严格 FP32。
+· 优化阶梯：naive → shared memory 分块 → 2D 寄存器分块（BM×BN×BK=128×128×8，
+  TM×TN=8×8，64 累加器/线程），N=4096 下 1.11 → 8.95 TFLOPS（8.0x），
+  达同精度 cuBLAS 的 73.4%。
+· 过程纪律：定「没有正确性 PASS 不测速、没有 ncu 数据不算完成」为铁律，
+  逐版本记录 DRAM 吞吐 / sectors-per-request / bank conflict / long-scoreboard stall。
+```
+
+**数据出处**（`sgemm-cuda/bench.csv` + `results/v0_baseline.csv`，N=4096）：
+
+| 版本 | my GFLOPS | cuBLAS GFLOPS | ratio |
+|---|---|---|---|
+| v0 naive | 1112.3 | 11178.7 | 0.100 |
+| v3 2d_tiling | **8946.9** | 12182.9 | **0.734** |
+| **加速比** | **8.0x** | — | — |
+
+> **后续更新点**：v4 float4 / v5 双缓冲 / v6 warp tiling 走完后换数字。
+> 同时记得把 `docs/ROADMAP.md` 里各版本记的 `____` 补上（那是简历数字的出处）。
+> ⚠️ 当前 `kernels/sgemm_v3_2d_tiling.cuh` 等还是 uncommitted 状态，**记得 commit + push**，
+> 否则 GitHub 上看到的还是空骨架。
 
