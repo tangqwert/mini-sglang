@@ -52,7 +52,7 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 - **跨模型瓶颈分析**：对照实验发现收益被「权重搬运地板效应」压缩（Qwen2.5-0.5B 仅 **1.95x**，
   短 prompt 反而 **0.94x 微负**），归纳出「每步耗时 = 固定开销 + 序列计算（∝ 上下文长度）」成本模型
 - **Continuous Batching**：实现左填充 + attention_mask + 显式 position_ids 的多请求批解码与
-  per-request 动态退出，4 请求批 516ms vs 逐条 606ms（**1.18x**），且与逐条输出逐 token 一致
+  per-request 动态退出，4 请求实测 **3.0x**（理想 4.0x），且与逐条输出逐 token 一致
 - **槽位连续准入**：实现调度器 + 固定槽位，冻结行立刻让位、pending 队列补入新请求
   （补入靠"左填充到当前批长 + 单独 prefill + 拷 cache 行"，与原生批内数值等价，误差 < 4e-5）；
   4 请求 / 2 槽位下总前向 10 → 8 次（**1.25x**，理想 2.00x），**并定位出差距来源是"补入需独立前向"**
@@ -127,7 +127,8 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 | M1 KV cache（gpt2, **696** tok） | 3.739s → 0.828s；29.2 → 6.5 ms/token，**4.51x** | `benchmark/results/m0_naive_long.json` / `m1_kv_long.json` |
 | M1 KV cache（Qwen2.5-0.5B, **601** tok） | 3.705s → 1.900s；28.9 → 14.8 ms/token，**1.95x** | `benchmark/results/m0_naive_qwen_long_en.json` / `m1_kv_qwen_long.json` |
 | M1 短 prompt（gpt2, **5** tok） | 0.738s → 0.783s；5.8 → 6.1 ms/token，**0.94x（微负）** | `benchmark/results/m0_naive_short.json` / `m1_kv_short.json` |
-| M2 batching（4 请求） | 批 516ms vs 逐条 606ms，**1.18x** | `benchmark/verify_m2.py` |
+| M2 batching（4 请求，各 24 token） | 553 → 178 ms，**3.0x**（理想 4.0x）；批内每 forward 5.8 → 7.4 ms（填充行 + 记账） | `benchmark/verify_m2.py` |
+| M2 batching 修正 | ⚠️ 旧值 **1.18x** 是**测量 bug**：benchmark 让批量路径跑第一个，独占了 CUDA/cuBLAS 冷启动（首次 581ms vs 预热后 183ms） | `benchmark/verify_m2.py` 注释 |
 | M2.5 连续准入（4 请求 / 2 槽位） | 静态分批 10 次前向 → **8 次**（6 步批量 + 2 次补入）；理想 2.00x，实测 **1.25x** | `tests/test_batching.py::TestContinuous` |
 | M3 radix 正确性 | 3 请求共享 118-token 前缀，cached vs 逐条输出**逐 token 一致** | `benchmark/verify_m3.py` |
 | M3 radix 耗时 | **0.82x** —— 小模型 prefill ≈5ms 被权重搬运主导，省下的计算 < clone + Python 开销 | `benchmark/verify_m3.py` |
@@ -192,6 +193,12 @@ Radix 前缀缓存 → 分页 KV / PagedAttention → 零填充 varlen 调度 �
 4. **不留占位符**：`xxx` / `待定` 一律不能出现在投递版
 5. **不写 AI 辅助工具**：`Cursor` / `Codex` / "Vibe Coding" 对 AI Infra 岗位是减分项
 6. **必写**：GitHub 链接 + 可实习时长（**可立即到岗，实习期 6 个月以上** —— 这是你的稀缺优势）
+7. **两个被测对象必须等价预热**：冷启动会**系统性地惩罚"先跑的那条路径"**
+   （实证：同一份代码首次 581ms vs 预热后 183ms，导致 M2 的收益被低估成 1.18x）。
+   所有 `verify_m*.py` / `bench.py` 统一口径：**预热一次 → best-of-3 → 取最短**
+8. **数字奇怪就先怀疑测量，再怀疑代码**：M2 报出 1.18x 时先做反向校验
+   （直接测单次前向在 B=1..8 的耗时，发现硬件支持近线性加速）→ 说明是测量问题。
+   **这条比多做一个优化更能证明工程素养。**
 
 ## 7. GitHub 展示（5 分钟，性价比最高的一步）
 

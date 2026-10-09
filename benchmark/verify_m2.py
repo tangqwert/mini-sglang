@@ -31,22 +31,39 @@ def main():
                     max_new_tokens=24, eos_token_id=tok.eos_token_id)
             for i, p in enumerate(prompts)]
 
-    # ── 批量跑（M2 引擎）──
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    # ── 正确性：批量结果 vs 逐条结果 ──
     outs_batch = batched_generate(kv_forward, reqs)
-    torch.cuda.synchronize()
-    t_batch = time.perf_counter() - t0
-
-    # ── 逐条跑（M1 引擎，正确性基线 + 耗时对照）──
     cfgs = [DecodingConfig(max_new_tokens=r.max_new_tokens, eos_token_id=r.eos_token_id)
             for r in reqs]
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
     outs_single = [kv_generate(kv_forward, r.prompt.clone(), cfg)
                    for r, cfg in zip(reqs, cfgs)]
-    torch.cuda.synchronize()
-    t_single = time.perf_counter() - t1
+
+    # ── 耗时 ──
+    # ⚠️ 必须先预热。本脚本早期版本让 batched 路径跑第一个，于是 CUDA 上下文创建 /
+    # cuBLAS handle / kernel 编译的冷启动开销【全部落在它头上】——实测首次 581ms、
+    # 预热后只有 183ms。修正后收益从 1.18x 变成 ~3.0x。
+    # 教训：**冷启动偏差会系统性地惩罚"先跑的那条路径"**，两个被测对象必须等价预热。
+    def run_batched():
+        return batched_generate(kv_forward, reqs)
+
+    def run_single():
+        for r, cfg in zip(reqs, cfgs):
+            kv_generate(kv_forward, r.prompt.clone(), cfg)
+
+    def timed(fn, repeat: int = 3) -> float:
+        fn()                                     # 预热（不计入）
+        torch.cuda.synchronize()
+        best = float('inf')
+        for _ in range(repeat):
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            best = min(best, time.perf_counter() - t)
+        return best * 1e3                        # 取最短（笔记本 GPU 有降频）
+
+    t_batch = timed(run_batched)
+    t_single = timed(run_single)
 
     print('\n=== 正确性：batch vs 逐条 ===')
     all_ok = True
@@ -56,10 +73,14 @@ def main():
         print(f'req{i}: {"✅ 一致" if same else "❌ 不一致!"}  len={b.shape[1]}  '
               f'文本: {tok.decode(b[0], skip_special_tokens=True)[:42]!r}')
 
-    print('\n=== 耗时 ===')
-    print(f'batched   (4 条一批): {t_batch * 1000:.0f} ms')
-    print(f'sequential(逐条 4 次): {t_single * 1000:.0f} ms')
-    print(f'batching 收益: {t_single / t_batch:.2f}x')
+    print('\n=== 耗时（已预热，best of 3）===')
+    n_forw_b = 1 + 23        # 1 次 prefill + 23 次 decode（预算 24）
+    print(f'batched   (4 条一批): {t_batch:.0f} ms   ({t_batch / n_forw_b:.1f} ms / forward)')
+    print(f'sequential(逐条 4 次): {t_single:.0f} ms   ({t_single / (4 * n_forw_b):.1f} ms / forward)')
+    print(f'batching 收益: {t_single / t_batch:.2f}x（理想 4.00x）')
+    print(f'  读法：批内每次 forward 是单条的 {t_batch / n_forw_b / (t_single / (4 * n_forw_b)):.2f}x'
+          '（填充行 + mask 拼接 + Python 记账），')
+    print('        但它一次服务 4 条请求 —— 所以净收益低于理想的 4x。')
     print('\n' + ('🎉 M2 真模型验证通过' if all_ok else '❌ 存在不一致，回查调度器'))
 
 
