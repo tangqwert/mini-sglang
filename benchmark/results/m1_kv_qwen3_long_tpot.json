@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "bfloat16",
+  "engine": "kv",
+  "prompt_tokens": 706,
+  "new_tokens": 128,
+  "runs": 3,
+  "total_s": 3.269763674994465,
+  "tokens_per_s": 39.14656003395006,
+  "ttft_ms": 39.1,
+  "tpot_ms": 25.442845708741917,
+  "decode_tokens_per_s": 39.30377959476481,
+  "run_tpot_ms": [30.7, 25.4, 25.3],
+  "run_ttft_ms": [40.6, 38.4, 39.1],
+  "timing_note": "Qwen3-0.6B，706-token prompt，3 次复跑中位数（TTFT 取中位数，total/tpot 取中位次运行）。TPOT = (last-first)/(n_new-1)，不含 prefill；59.0 → 25.4 ms = 2.3x，整段 7.54 → 3.27 s = 2.3x。"
+}

@@ -1,0 +1,8 @@
+{
+  "model": "gpt2",
+  "engine": "kv",
+  "prompt_tokens": 5,
+  "new_tokens": 128,
+  "total_s": 0.7829485139991448,
+  "tokens_per_s": 163.48456853976455
+}

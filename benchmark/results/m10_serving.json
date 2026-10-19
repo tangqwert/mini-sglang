@@ -1,0 +1,59 @@
+{
+  "base_url": "http://127.0.0.1:8015",
+  "model": "gpt2",
+  "num_prompts": 32,
+  "max_tokens": 16,
+  "temperature": 0.0,
+  "warmup": 2,
+  "note": "非流式：latency 是端到端（没有 TTFT）；服务是单进程锁串行，并发升高主要是排队；backend/graph/radix 由启动 server 时的参数决定",
+  "levels": [
+    {
+      "concurrency": 1,
+      "requests": 32,
+      "success": 32,
+      "errors": 0,
+      "wall_s": 3.9279172309907153,
+      "requests_per_s": 8.146811177059561,
+      "output_tokens": 512,
+      "output_tokens_per_s": 130.34897883295298,
+      "mean_ms": 122.71760590783742,
+      "p50_ms": 122.729087001062,
+      "p90_ms": 127.67562340159202,
+      "p99_ms": 132.7172167073877,
+      "min_ms": 114.6483049960807,
+      "max_ms": 132.92806599929463
+    },
+    {
+      "concurrency": 2,
+      "requests": 32,
+      "success": 32,
+      "errors": 0,
+      "wall_s": 3.9114681770006428,
+      "requests_per_s": 8.181071288821773,
+      "output_tokens": 512,
+      "output_tokens_per_s": 130.89714062114837,
+      "mean_ms": 240.51423049968434,
+      "p50_ms": 242.45137000252726,
+      "p90_ms": 252.14754659682512,
+      "p99_ms": 268.9712798196706,
+      "min_ms": 124.42164699314162,
+      "max_ms": 270.6165669951588
+    },
+    {
+      "concurrency": 4,
+      "requests": 32,
+      "success": 32,
+      "errors": 0,
+      "wall_s": 3.910253838999779,
+      "requests_per_s": 8.183611938652408,
+      "output_tokens": 512,
+      "output_tokens_per_s": 130.93779101843853,
+      "mean_ms": 465.81798184342915,
+      "p50_ms": 486.63687899534125,
+      "p90_ms": 499.6274232995347,
+      "p99_ms": 505.99193935340736,
+      "min_ms": 122.47893400490284,
+      "max_ms": 506.23288498900365
+    }
+  ]
+}

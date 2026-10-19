@@ -1,0 +1,16 @@
+{
+  "milestone": "M7",
+  "source": "benchmark/verify_m7.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "setup": "gpt2 + paged KV + Triton kernel; decode step (1 token/row); 60 steps; best of 3",
+  "correctness": true,
+  "batches": [
+    {"B": 1, "eager_row_ms": 7.585, "eager_vectorized_ms": 7.930, "graph_ms": 3.287, "B_over_A": 1.05, "C_over_B": 0.41, "C_over_A": 2.31},
+    {"B": 2, "eager_row_ms": 8.974, "eager_vectorized_ms": 8.216, "graph_ms": 3.505, "B_over_A": 0.92, "C_over_B": 0.43, "C_over_A": 2.56},
+    {"B": 4, "eager_row_ms": 11.354, "eager_vectorized_ms": 8.174, "graph_ms": 3.792, "B_over_A": 0.72, "C_over_B": 0.46, "C_over_A": 2.99},
+    {"B": 8, "eager_row_ms": 16.191, "eager_vectorized_ms": 8.955, "graph_ms": 4.227, "B_over_A": 0.55, "C_over_B": 0.47, "C_over_A": 3.83}
+  ],
+  "note": "B/A = KV 写入向量化收益；C/B = CUDA Graph 单独收益；C/A = 两者合计。数值为单次复跑快照（B=8 C/A=3.83x），历史 README 值为 5.3x（B=8，A→C 合计，含向量化）；纯 Graph 看 C/B 的倒数，约 2.1–2.4x。"
+}

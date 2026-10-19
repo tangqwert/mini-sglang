@@ -1,0 +1,15 @@
+{
+  "model": "gpt2",
+  "engine": "naive",
+  "prompt_tokens": 696,
+  "new_tokens": 128,
+  "runs": 3,
+  "total_s": 3.5198126929899445,
+  "tokens_per_s": 36.365571456380245,
+  "ttft_ms": 23.6766180023551,
+  "tpot_ms": 27.527850425131177,
+  "decode_tokens_per_s": 36.326846613750256,
+  "run_tpot_ms": [27.0, 27.5, 28.2],
+  "run_ttft_ms": [23.4, 23.7, 26.0],
+  "timing_note": "3 次复跑的中位数（run_tpot_ms 为四舍五入值）。TTFT = 首 token 时间；TPOT = (last-first)/(n_new-1)，不含 prefill。与 m1_kv_long_tpot.json 同一 696-token prompt 对比。"
+}

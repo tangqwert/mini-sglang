@@ -1,0 +1,42 @@
+{
+  "milestone": "M4b Step 4",
+  "source": "benchmark/verify_m4b.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "workload": {
+    "long_prompt_tokens": 153,
+    "long_budget": 30,
+    "short_requests": 8,
+    "short_budget": 2,
+    "slots": 2
+  },
+  "correctness": {
+    "two_schedulers_match": true,
+    "paged_matches_naive": true
+  },
+  "m2_5": {
+    "steps": 29,
+    "admissions": 7,
+    "admission_forwards": 7,
+    "total_forwards": 37,
+    "fed_tokens": 1463,
+    "padded_positions": 1220,
+    "idle_slot_steps": 21,
+    "wall_ms": 299,
+    "kv_mb": 2.2
+  },
+  "step4": {
+    "steps": 29,
+    "admissions": 7,
+    "admission_forwards": 7,
+    "total_forwards": 37,
+    "fed_tokens": 222,
+    "padded_positions": 0,
+    "idle_slot_steps": 21,
+    "wall_ms": 592,
+    "kv_mb": 1.2
+  },
+  "fed_tokens_ratio": 6.59,
+  "note": "分页只消掉填充计算，前向次数不变；墙钟反而更慢（Python 逐序列注意力）。"
+}

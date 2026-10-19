@@ -1,0 +1,16 @@
+{
+  "milestone": "M3",
+  "source": "benchmark/verify_m3.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "workload": {
+    "shared_prefix_tokens": 118,
+    "requests": 3
+  },
+  "correctness": true,
+  "cached_ms": 444,
+  "sequential_ms": 362,
+  "speedup": 0.81,
+  "note": "负收益：小模型 prefill 被权重搬运主导，clone + Python 开销反超省下的前缀计算。"
+}

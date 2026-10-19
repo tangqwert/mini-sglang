@@ -1,0 +1,8 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "engine": "kv",
+  "prompt_tokens": 601,
+  "new_tokens": 128,
+  "total_s": 1.8997918579989346,
+  "tokens_per_s": 67.37580196539183
+}

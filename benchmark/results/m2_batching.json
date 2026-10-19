@@ -1,0 +1,18 @@
+{
+  "milestone": "M2",
+  "source": "benchmark/verify_m2.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "workload": {
+    "requests": 4,
+    "max_new_tokens": 24
+  },
+  "correctness": true,
+  "batched_ms": 168,
+  "sequential_ms": 528,
+  "speedup": 3.15,
+  "ideal_speedup": 4.0,
+  "per_forward_ratio_vs_single": 1.27,
+  "measurement": "warmup + best of 3; CUDA synchronize around each run"
+}

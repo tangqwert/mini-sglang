@@ -1,0 +1,57 @@
+{
+  "milestone": "M6",
+  "source": "benchmark/verify_m6.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "workload": {
+    "long_prompt_tokens": 153,
+    "long_budget": 30,
+    "short_requests": 8,
+    "short_budget": 2,
+    "slots": 2
+  },
+  "correctness": {
+    "three_paths_match": true,
+    "m6_matches_naive": true
+  },
+  "m2_5": {
+    "total_forwards": 37,
+    "admission_forwards": 7,
+    "fed_tokens": 1463,
+    "peak_step_tokens": 306,
+    "padded_positions": 1220,
+    "mixed_steps": 0,
+    "prefill_chunks": 0,
+    "idle_slot_steps": 21,
+    "wall_ms": 332
+  },
+  "step4": {
+    "total_forwards": 37,
+    "admission_forwards": 7,
+    "fed_tokens": 222,
+    "peak_step_tokens": 157,
+    "padded_positions": 0,
+    "mixed_steps": 0,
+    "prefill_chunks": 0,
+    "idle_slot_steps": 21,
+    "wall_ms": 602
+  },
+  "m6": {
+    "total_forwards": 30,
+    "admission_forwards": 0,
+    "fed_tokens": 222,
+    "peak_step_tokens": 157,
+    "padded_positions": 0,
+    "mixed_steps": 7,
+    "prefill_chunks": 9,
+    "idle_slot_steps": 14,
+    "wall_ms": 554
+  },
+  "max_prefill_tokens_sweep": [
+    {"limit": "unlimited", "total_forwards": 30, "peak_step_tokens": 157, "wall_ms": 555},
+    {"limit": 64, "total_forwards": 32, "peak_step_tokens": 64, "wall_ms": 574},
+    {"limit": 16, "total_forwards": 39, "peak_step_tokens": 16, "wall_ms": 635}
+  ],
+  "note": "M6 消掉补入独立前向（7 → 0）；上限越紧，单步峰值越低但前向次数越多。"
+}

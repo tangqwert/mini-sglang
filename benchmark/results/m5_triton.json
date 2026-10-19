@@ -1,0 +1,31 @@
+{
+  "milestone": "M5",
+  "source": "benchmark/verify_m5.py",
+  "model": "gpt2",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "measured_at": "2026-10-18",
+  "end_to_end": {
+    "workload": "M6 scheduler: 1 long (153 tok) + 8 short, B=2",
+    "correctness": true,
+    "pytorch_ms": 667,
+    "triton_ms": 258,
+    "speedup": 2.59,
+    "forwards": 30,
+    "fed_tokens": 222
+  },
+  "microbenchmark": {
+    "setup": "1 sequence x 12 heads x 64 dim, n_q=1, Triton",
+    "rows": [
+      {"seq_len": 128, "block": 8,  "pytorch_ms": 0.312, "triton_ms": 0.363, "speedup": 0.86, "max_abs_diff": 2.68e-07},
+      {"seq_len": 128, "block": 16, "pytorch_ms": 0.384, "triton_ms": 0.388, "speedup": 0.99, "max_abs_diff": 2.68e-07},
+      {"seq_len": 128, "block": 32, "pytorch_ms": 0.430, "triton_ms": 0.393, "speedup": 1.10, "max_abs_diff": 2.68e-07},
+      {"seq_len": 512, "block": 8,  "pytorch_ms": 0.424, "triton_ms": 0.378, "speedup": 1.12, "max_abs_diff": 1.56e-07},
+      {"seq_len": 512, "block": 16, "pytorch_ms": 0.381, "triton_ms": 0.419, "speedup": 0.91, "max_abs_diff": 1.56e-07},
+      {"seq_len": 512, "block": 32, "pytorch_ms": 0.419, "triton_ms": 0.424, "speedup": 0.99, "max_abs_diff": 1.56e-07},
+      {"seq_len": 2048, "block": 8,  "pytorch_ms": 0.454, "triton_ms": 0.542, "speedup": 0.84, "max_abs_diff": 1.56e-07},
+      {"seq_len": 2048, "block": 16, "pytorch_ms": 0.420, "triton_ms": 0.487, "speedup": 0.86, "max_abs_diff": 1.56e-07},
+      {"seq_len": 2048, "block": 32, "pytorch_ms": 0.404, "triton_ms": 0.495, "speedup": 0.82, "max_abs_diff": 1.56e-07}
+    ],
+    "note": "微基准加速比不随 seq_len 单调：PyTorch 版启动受限，Triton 版带宽受限；单序列只有 H=12 个 program。"
+  }
+}
