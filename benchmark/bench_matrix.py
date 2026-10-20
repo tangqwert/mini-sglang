@@ -279,18 +279,16 @@ def run_multi(meta, reqs, repeat, batch=2, max_prefill_tokens=64):
 
     def seq_kv():
         timer = WallTimer()
+        timer.start()
         outs, per_req = [], []
-        t0 = time.perf_counter()
         for r in _fresh_requests(reqs):
-            rt = WallTimer()
-            rt.start()
             out = kv_generate(
                 kv_forward, r.prompt, DecodingConfig(max_new_tokens=r.max_new_tokens),
-                on_step=lambda step, _tok, rid=r.req_id: rt.mark(rid))
+                on_step=lambda step, _tok, rid=r.req_id: timer.mark(rid))
             torch.cuda.synchronize() if device.type == "cuda" else None
             outs.append(out)
-            per_req.append(_req_metrics(rt.times[r.req_id]))
-        wall = time.perf_counter() - t0
+            per_req.append(_req_metrics(timer.times[r.req_id]))
+        wall = time.perf_counter() - timer.t0
         return outs, per_req, wall, None
 
     def static_batch():

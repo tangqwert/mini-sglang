@@ -37,15 +37,21 @@ class TestPool:
         pool.free(b1)
         assert len(pool.free_blocks) == 2 and b1 in pool.free_blocks
 
-    def test_pool_exhaustion_raises(self):
+    def test_pool_exhaustion_and_rollback(self):
         pool = PagedKVPool(num_blocks=1, block_size=8, num_layers=2,
                            num_heads=2, head_dim=4)
         pool.allocate()
-        try:
+        with pytest.raises(RuntimeError):
             pool.allocate()
-            assert False, "池子耗尽应抛 RuntimeError"
-        except RuntimeError:
-            pass
+
+        # 失败请求不能把已经领到的块留在页表/池外
+        pool = PagedKVPool(num_blocks=2, block_size=4, num_layers=1,
+                           num_heads=1, head_dim=1)
+        table = []
+        with pytest.raises(RuntimeError):
+            ensure_blocks(pool, table, 100)
+        assert table == []
+        assert len(pool.free_blocks) == 2
 
 
 class TestGather:

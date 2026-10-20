@@ -137,37 +137,37 @@ M10 再把模型 / 分页池 / 调度 / 采样收进 `LLMEngine`，HTTP 层只�
 
 | 模式 | TTFT | TPOT | 端到端 |
 |---|---:|---:|---:|
-| naive | 26.2 ms | 30.26 ms | 3870 ms |
-| KV（M1） | 21.4 ms | 6.18 ms | 806 ms |
-| paged-PyTorch | 759.8 ms | 11.08 ms | 2167 ms |
-| paged-Triton | 28.9 ms | 8.51 ms | 1110 ms |
-| paged-Triton-Graph | 26.0 ms | **4.23 ms** | **563 ms** |
+| naive | 42.9 ms | 30.54 ms | 3922 ms |
+| KV（M1） | 22.6 ms | 6.45 ms | 841 ms |
+| paged-PyTorch | 815.4 ms | 11.34 ms | 2255 ms |
+| paged-Triton | 27.5 ms | 8.84 ms | 1150 ms |
+| paged-Triton-Graph | 28.0 ms | **4.22 ms** | **563 ms** |
 
-- **naive → full graph**：TPOT **7.2x**、端到端 **6.9x** —— 这是**整引擎单请求加速**，
+- **naive → full graph**：TPOT **7.2x**、端到端 **7.0x** —— 这是**整引擎单请求加速**，
   不是 KV Cache 单独的功劳。
-- **paged-PyTorch → paged-Triton**：端到端 **1.95x**，这是 kernel 的功劳。
-- **paged-Triton → Graph**：端到端 **1.97x**；Graph 在计时前预捕获，不把捕获成本算进 TTFT。
+- **paged-PyTorch → paged-Triton**：端到端 **1.96x**，这是 kernel 的功劳。
+- **paged-Triton → Graph**：端到端 **2.04x**；Graph 在计时前预捕获，不把捕获成本算进 TTFT。
 
 多请求（1 长 + 8 短，预算 64/16，B=4，所有请求同时到达）：
 
 | 模式 | Makespan | 输出吞吐 | p50 E2E | p99 E2E |
 |---|---:|---:|---:|---:|
-| 顺序 KV | 1192 ms | 161 tok/s | 101.6 ms | 388.8 ms |
-| 静态 batching | 566 ms | 339 tok/s | 176.9 ms | 565.6 ms |
-| full（无图） | 714 ms | 269 tok/s | 399.2 ms | 713.6 ms |
-| **full-graph** | **311 ms** | **617 tok/s** | 171.9 ms | 310.4 ms |
+| 顺序 KV | 1317 ms | 146 tok/s | 916.3 ms | 1317 ms |
+| 静态 batching | 575 ms | 334 tok/s | 176.2 ms | 574 ms |
+| full（无图） | 748 ms | 257 tok/s | 426.5 ms | 747 ms |
+| **full-graph** | **309 ms** | **622 tok/s** | **166.7 ms** | **308 ms** |
 
 - 静态 batching 是强基线（HF 融合批式注意力）；
 - full 无图反而比静态 batch 慢，说明 **Triton/分页在单序列小模型上不占优**；
-- full-graph 把 decode launch 开销消掉后，多请求比顺序 KV **3.8x**、比静态 batching **1.8x**。
+- full-graph 把 decode launch 开销消掉后，多请求比顺序 KV **4.3x**、比静态 batching **1.9x**。
 - 该 workload 是所有请求同时到达；真实错峰到达时，静态 batching 还需要额外等待策略，full 的优势会更明显。
 
 Qwen3-0.6B bf16（706-token / 128 new，256 blocks）：
 
-- 单请求：naive TPOT 59.4 → full-graph **13.3 ms（4.5x）**，端到端 7.60 → 1.81 s（4.2x）；
-  KV 单独为 27.4 ms，full-graph 相对 KV 再快 **2.1x**。
-- 多请求（同 1 长 + 8 短 / B=4）：顺序 KV 5389 → full-graph **777 ms（6.9x）**、36 → 247 tok/s；
-  静态 batching 2114 ms，full-graph 为其 **2.7x**。
+- 单请求：naive TPOT 95.0 → full-graph **17.5 ms（5.4x）**，端到端 12.12 → 2.45 s（5.0x）；
+  KV 单独为 36.0 ms，full-graph 相对 KV 再快 **2.1x**。
+- 多请求（同 1 长 + 8 短 / B=4）：顺序 KV 6444 → full-graph **1126 ms（5.7x）**、30 → 171 tok/s；
+  静态 batching 2588 ms，full-graph 为其 **2.3x**。
 
 ## 核心洞察：八个"理论收益 ≠ 实测收益"的对照实验
 

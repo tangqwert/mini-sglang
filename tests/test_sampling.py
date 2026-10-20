@@ -115,6 +115,7 @@ class TestSampleToken:
                   SamplingParams(temperature=1.0, seed=1)]
         gens = [p.make_generator("cpu") for p in params]
         draws = [sample_tokens(logits, params, gens) for _ in range(50)]
+        assert draws[0].shape == (2, 1), "非贪心批采样必须返回 [B,1]"
         out = torch.cat(draws, dim=1)                 # [2, 50]
         assert (out[0] == logits[0].argmax()).all(), "第一行 top_k=1 → 恒等于 argmax"
         assert out[1].unique().numel() > 1, "第二行应真的在采样"

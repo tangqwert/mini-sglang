@@ -250,8 +250,16 @@ def ensure_blocks(pool: PagedKVPool, block_table: list, total_len: int) -> None:
     所以"分页省显存"的另一半兑现方式 = 分页表随序列变长而变长。
     """
     need = -(-total_len // pool.block_size)              # 向上取整
-    while len(block_table) < need:
-        block_table.append(pool.allocate())
+    start = len(block_table)
+    try:
+        while len(block_table) < need:
+            block_table.append(pool.allocate())
+    except Exception:
+        # 显存不足时，把本次已经领到的块全部退回，避免失败请求泄漏页池。
+        for block_id in block_table[start:]:
+            pool.free(block_id)
+        del block_table[start:]
+        raise
 
 def scatter_kv(pool: PagedKVPool, layer: int, table_t: torch.Tensor,
                base: int, k: torch.Tensor, v: torch.Tensor) -> None:

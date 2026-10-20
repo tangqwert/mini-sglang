@@ -37,13 +37,15 @@
   - 多请求：1 长 + 8 短（预算 64/16），B=4，**所有请求同时到达**；
     `static-batch` 是强基线（HF 融合批式注意力），`full` 是 paged+Chunked+Triton，
     `full-graph` 复用预捕获图。
-  - 关键不要混：`full`（无图）多请求 714 ms，`full-graph` 311 ms；两者的差异是
+  - 关键不要混：`full`（无图）多请求 748 ms，`full-graph` 309 ms；两者的差异是
     **图捕获是否在计时内**，不是“图让 kernel 变快”这么简单。
 - `matrix_qwen3_bf16.json` 是 Qwen3-0.6B、bf16 权重 + bf16 pool、256 blocks、706-token prompt；
+  单请求 full-graph TPOT 95.0 → 17.5 ms（5.4x），多请求 6444 → 1126 ms（5.7x）。
   Triton kernel 内部把 q/k/v 转 fp32 计算，因此不是“bf16 精度逐元素对齐”的证明。
 - 计时前**预热**，重复 3 次取最短（笔记本 GPU 降频会导致约 ±30% 的波动）。
-- M2–M7 是 2026-10-18 的复跑快照；README 的表格使用较早/代表性测量值。
-  两者若有差异，以**同一脚本同一次运行**的相对关系为准，不要跨次比较绝对毫秒。
+- M2–M7 是独立复跑快照；README 的表格使用 `matrix_*.json` 同次测量值。
+  不同批次会受笔记本 GPU 降频影响（可达 ±30%），优先看**同一次运行内**的相对关系，
+  不要跨次比较绝对毫秒。
 - 正确性字段（`correctness` / `all_matches_naive`）来自脚本内的逐 token 对比。
 - M10 是非流式、单进程锁串行；`m10_serving.json` 的 latency 是端到端，不是 TTFT。
   并发 1/2/4 的吞吐稳定在 ~8.2 req/s，p50 线性增长，这就是“排队”而不是 continuous batching。

@@ -155,7 +155,7 @@ def sample_tokens(logits: torch.Tensor, params_list: list[SamplingParams],
 
     rows = [sample_token(logits[i], params_list[i], generators[i]).reshape(1)
             for i in range(b)]
-    return torch.stack(rows, dim=0).unsqueeze(-1)
+    return torch.stack(rows, dim=0)
 
 
 def token_stops(params: SamplingParams, eos_token_id: int | None, token: int) -> bool:
